@@ -1,0 +1,7 @@
+/target
+
+# Live plugins stay on disk. They are not part of this repo.
+/plugins/
+
+# Release zips and unpacked binaries. Built when asked, not stored here.
+/dist/

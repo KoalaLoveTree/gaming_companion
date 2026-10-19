@@ -1,0 +1,16 @@
+id = "sample"
+name = "Sample"
+entry = "page"
+
+[[resource]]
+id = "page"
+title = "Page"
+kind = "url"
+src = "https://example.com/sheet"
+inject = ["inject.css"]
+
+[[resource]]
+id = "notes"
+title = "Notes"
+kind = "markdown"
+src = "notes.md"

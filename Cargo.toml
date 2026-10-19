@@ -1,0 +1,29 @@
+[package]
+name = "gaming_companion"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = ["window"]
+window = ["dep:tao", "dep:wry", "dep:tray-icon"]
+
+[dependencies]
+dirs = "6"
+pulldown-cmark = "0.13"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+tao = { version = "0.37", optional = true }
+tray-icon = { version = "0.26.1", optional = true, default-features = false, features = ["ksni"] }
+wry = { version = "0.57", optional = true }
+global-hotkey = "0.9.0"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+dbus = "0.9.12"
+gdkwayland-sys = "0.18.2"
+gtk = "0.18"
+libc = "0.2"
+webkit2gtk = { version = "=2.0.2", features = ["v2_38"] }
+
+[[bin]]
+name = "gaming_companion"
+required-features = ["window"]
