@@ -26,41 +26,143 @@ struct PluginFile {
 pub fn load_plugins(dir: &Path) -> Result<LoadOutcome> {
     let mut plugins = Vec::new();
     let mut errors = Vec::new();
-    let mut entries = fs::read_dir(dir)
-        .map_err(|err| Error::new(format!("reading {}: {err}", dir.display())))?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    entries.sort_by_key(|entry| entry.file_name());
+    let entries = read_sorted(dir)?;
 
     for entry in entries {
         let path = entry.path();
         if !path.is_dir() {
             continue;
         }
-        let manifest = path.join("plugin.toml");
-        if !manifest.is_file() {
+        let Some(name) = folder_key(&path) else {
+            continue;
+        };
+        // A folder with its own manifest is one plugin. Its children are files
+        // of that plugin, not more plugins.
+        if path.join("plugin.toml").is_file() {
+            consider(&path, None, &mut plugins, &mut errors);
             continue;
         }
-        match load_plugin(&path) {
-            Ok(plugin) => {
-                if plugins.iter().any(|loaded: &Plugin| loaded.id == plugin.id) {
-                    errors.push(format!(
-                        "{}: duplicate plugin id '{}'",
-                        path.display(),
-                        plugin.id
-                    ));
-                } else {
-                    plugins.push(plugin);
-                }
+        let game = (name.clone(), game_label(&path, &name));
+        let children = match read_sorted(&path) {
+            Ok(children) => children,
+            Err(err) => {
+                errors.push(err.to_string());
+                continue;
             }
-            Err(err) => errors.push(format!("{}: {err}", path.display())),
+        };
+        for child in children {
+            let child_path = child.path();
+            if !child_path.is_dir() || folder_key(&child_path).is_none() {
+                continue;
+            }
+            if !child_path.join("plugin.toml").is_file() {
+                continue;
+            }
+            consider(&child_path, Some(game.clone()), &mut plugins, &mut errors);
         }
     }
 
-    plugins.sort_by(|left, right| left.id.cmp(&right.id));
+    plugins.sort_by(|left, right| {
+        left.game_name
+            .to_ascii_lowercase()
+            .cmp(&right.game_name.to_ascii_lowercase())
+            .then(
+                left.name
+                    .to_ascii_lowercase()
+                    .cmp(&right.name.to_ascii_lowercase()),
+            )
+            .then(left.id.cmp(&right.id))
+    });
     Ok(LoadOutcome { plugins, errors })
 }
 
+fn consider(
+    path: &Path,
+    game: Option<(String, String)>,
+    plugins: &mut Vec<Plugin>,
+    errors: &mut Vec<String>,
+) {
+    match load_plugin_as(path, game) {
+        Ok(plugin) => {
+            if plugins.iter().any(|loaded| loaded.id == plugin.id) {
+                errors.push(format!(
+                    "{}: duplicate plugin id '{}'",
+                    path.display(),
+                    plugin.id
+                ));
+            } else {
+                plugins.push(plugin);
+            }
+        }
+        Err(err) => errors.push(format!("{}: {err}", path.display())),
+    }
+}
+
+fn read_sorted(dir: &Path) -> Result<Vec<fs::DirEntry>> {
+    let mut entries = fs::read_dir(dir)
+        .map_err(|err| Error::new(format!("reading {}: {err}", dir.display())))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    entries.sort_by_key(|entry| entry.file_name());
+    Ok(entries)
+}
+
+/// Directory names that would break the `game:<id>` message, and hidden folders.
+fn folder_key(path: &Path) -> Option<String> {
+    let name = path.file_name()?.to_str()?;
+    if name.is_empty()
+        || name.starts_with('.')
+        || name.chars().any(|ch| ch.is_control() || ch == ':')
+    {
+        return None;
+    }
+    Some(name.to_string())
+}
+
+fn game_label(dir: &Path, folder: &str) -> String {
+    let path = dir.join("game.toml");
+    if let Ok(text) = read_limited(&path) {
+        if let Ok(file) = toml::from_str::<GameFile>(&text) {
+            let name = file.name.trim();
+            if !name.is_empty() {
+                return name.to_string();
+            }
+        }
+    }
+    title_case(folder)
+}
+
+fn title_case(folder: &str) -> String {
+    let mut words = Vec::new();
+    for part in folder.split(|ch| ch == '-' || ch == '_') {
+        if part.is_empty() {
+            continue;
+        }
+        let mut chars = part.chars();
+        let Some(first) = chars.next() else {
+            continue;
+        };
+        let mut word = first.to_uppercase().collect::<String>();
+        word.push_str(chars.as_str());
+        words.push(word);
+    }
+    if words.is_empty() {
+        folder.to_string()
+    } else {
+        words.join(" ")
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct GameFile {
+    name: String,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn load_plugin(dir: &Path) -> Result<Plugin> {
+    load_plugin_as(dir, None)
+}
+
+fn load_plugin_as(dir: &Path, game: Option<(String, String)>) -> Result<Plugin> {
     let root = dir
         .canonicalize()
         .map_err(|err| Error::new(format!("plugin directory: {err}")))?;
@@ -93,9 +195,12 @@ pub fn load_plugin(dir: &Path) -> Result<Plugin> {
             file.entry
         )));
     }
+    let (game_id, game_name) = game.unwrap_or_else(|| (file.id.clone(), file.name.clone()));
     Ok(Plugin {
         id: file.id,
         name: file.name,
+        game_id,
+        game_name,
         entry: file.entry,
         root,
         resources: file.resource,
@@ -326,7 +431,93 @@ src = "../outside.html"
         };
         let (plugin, resource) = choose(&loaded.plugins, &config).unwrap();
         assert_eq!(plugin.id, "sample");
+        assert_eq!(plugin.game_id, "sample");
         assert_eq!(resource.id, "page");
         assert_eq!(resource.kind, ResourceKind::Url);
+    }
+
+    #[test]
+    fn a_game_folder_holds_plugins_that_delete_separately() {
+        let dir = TempDir::new();
+        let game = dir.0.join("arc-raiders");
+        write_plugin(
+            &game.join("loot"),
+            r#"
+id = "loot"
+name = "Loot"
+entry = "sheet"
+[[resource]]
+id = "sheet"
+title = "Sheet"
+kind = "html"
+src = "sheet.html"
+"#,
+        );
+        fs::write(game.join("loot/sheet.html"), "<p>loot</p>").unwrap();
+        fs::write(game.join("game.toml"), "name = \"Arc Raiders\"\n").unwrap();
+        write_plugin(
+            &game.join("maps"),
+            r#"
+id = "maps"
+name = "Maps"
+entry = "maps"
+[[resource]]
+id = "maps"
+title = "Maps"
+kind = "url"
+src = "https://arctracker.io/maps"
+"#,
+        );
+        // A manifest on the game folder would make the folder one plugin.
+        // A deeper folder is not another plugin.
+        write_plugin(
+            &game.join("maps/extra"),
+            "id = \"extra\"\nname = \"Extra\"\nentry = \"nope\"\n",
+        );
+
+        let loaded = load_plugins(&dir.0).unwrap();
+        assert!(loaded.errors.is_empty(), "{:?}", loaded.errors);
+        assert_eq!(loaded.plugins.len(), 2);
+        assert_eq!(loaded.plugins[0].id, "loot");
+        assert_eq!(loaded.plugins[0].game_id, "arc-raiders");
+        assert_eq!(loaded.plugins[0].game_name, "Arc Raiders");
+        assert_eq!(loaded.plugins[1].id, "maps");
+        assert_eq!(loaded.plugins[1].game_name, "Arc Raiders");
+    }
+
+    #[test]
+    fn a_folder_with_plugin_toml_is_not_a_game_folder() {
+        let dir = TempDir::new();
+        write_plugin(
+            &dir.0.join("whole"),
+            r#"
+id = "whole"
+name = "Whole"
+entry = "page"
+[[resource]]
+id = "page"
+title = "Page"
+kind = "url"
+src = "https://example.com/whole"
+"#,
+        );
+        write_plugin(
+            &dir.0.join("whole/child"),
+            r#"
+id = "child"
+name = "Child"
+entry = "page"
+[[resource]]
+id = "page"
+title = "Page"
+kind = "url"
+src = "https://example.com/child"
+"#,
+        );
+
+        let loaded = load_plugins(&dir.0).unwrap();
+        assert!(loaded.errors.is_empty(), "{:?}", loaded.errors);
+        assert_eq!(loaded.plugins.len(), 1);
+        assert_eq!(loaded.plugins[0].id, "whole");
     }
 }

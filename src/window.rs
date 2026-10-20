@@ -8,13 +8,15 @@ use tao::{
     dpi::{LogicalPosition, LogicalSize},
     event::{Event, WindowEvent},
     event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy},
-    window::{ResizeDirection, WindowBuilder},
+    window::WindowBuilder,
 };
 use wry::{WebContext, WebViewBuilder};
 
 use crate::controller::paths::{self, webview_data_dir};
 use crate::controller::plugins::{choose, load_plugins};
-use crate::controller::prepare::prepare_page;
+use crate::controller::prepare::{catalog_script, matching_resource, prepare_page};
+use crate::model::Plugin;
+use crate::model::bindings::{self, Action};
 use crate::model::config::{self, AppConfig, WindowFrame};
 use crate::model::hotkey::{self, Hotkey};
 use crate::settings;
@@ -27,6 +29,8 @@ enum ShellEvent {
         activation_token: Option<String>,
     },
     Ipc(String),
+    /// The webview finished loading this address. Used to follow Back and Forward.
+    Navigated(String),
     Bound(String),
     Failed(String),
     /// The window exists, so the portal dialog can be parented to it.
@@ -46,7 +50,8 @@ pub fn launch() -> Result<()> {
     }
     let config_file = paths::config_path()?;
     let mut config = paths::load_config(&config_file)?;
-    let (plugin, resource) = choose(&loaded.plugins, &config)?;
+    let plugins = loaded.plugins;
+    let (plugin, resource) = choose(&plugins, &config)?;
     let page = prepare_page(plugin, resource)?;
     config.active_plugin = plugin.id.clone();
     config.active_resource = Some(resource.id.clone());
@@ -65,7 +70,15 @@ pub fn launch() -> Result<()> {
 
     let event_loop = EventLoopBuilder::<ShellEvent>::with_user_event().build();
     let proxy = event_loop.create_proxy();
-    let mut shell = Shell::arm(prepared, proxy.clone(), hotkey, config, config_file);
+    let mut shell = Shell::arm(
+        prepared,
+        proxy.clone(),
+        hotkey,
+        config,
+        config_file,
+        plugins,
+    );
+    let catalog = catalog_script(&shell.plugins)?;
 
     let startup = active_frame(&shell.config);
     let mut builder = WindowBuilder::new()
@@ -73,6 +86,7 @@ pub fn launch() -> Result<()> {
         .with_inner_size(LogicalSize::new(startup.width, startup.height))
         .with_min_inner_size(LogicalSize::new(320.0, 240.0))
         .with_resizable(true)
+        .with_maximizable(false)
         .with_transparent(true)
         .with_decorations(false)
         .with_always_on_top(true)
@@ -85,19 +99,24 @@ pub fn launch() -> Result<()> {
         .map_err(|err| Error::new(format!("opening window: {err}")))?;
 
     let mut web_context = WebContext::new(Some(webview_data_dir()?));
-    #[cfg(target_os = "linux")]
     let ipc_proxy = proxy.clone();
-    #[cfg(not(target_os = "linux"))]
-    let ipc_proxy = proxy;
     let webview = build_webview(
         &window,
         &mut web_context,
         &page,
+        catalog.as_deref(),
+        &shell.plugins,
+        &shell.config.active_plugin,
         ipc_proxy,
         &shell.shortcut,
         shell.host.confirms(),
         shell.config.overlay,
+        &shell.config.bindings,
     )?;
+    OVERLAY.store(shell.config.overlay, Ordering::Relaxed);
+    #[cfg(target_os = "linux")]
+    crate::frame::set_overlay(shell.config.overlay);
+    install_chrome(&window, &webview);
     #[cfg(target_os = "linux")]
     linux_scale::watch(&webview);
     #[cfg(not(target_os = "linux"))]
@@ -155,13 +174,13 @@ pub fn launch() -> Result<()> {
                 event: WindowEvent::Resized(_),
                 ..
             } => shell.pass_margin(&window),
-            // Windows and macOS. The webview already paints at this scale;
-            // page zoom stays at 1 so the layout does not double.
+            // Windows and macOS. The webview already paints at this scale.
+            // Reapply the user's page zoom. It is not the monitor scale.
             Event::WindowEvent {
                 event: WindowEvent::ScaleFactorChanged { scale_factor, .. },
                 ..
             } => {
-                let _ = webview.zoom(1.0);
+                let _ = webview.zoom(shell.zoom);
                 eprintln!("gaming_companion: {}", monitor_label(&window, scale_factor));
             }
             Event::UserEvent(ShellEvent::Quit) => {
@@ -221,7 +240,7 @@ mod linux_scale {
     pub fn watch(webview: &wry::WebView) {
         let page = webview.webview();
         // Zoom is layout, not resolution. The widget scale is the pixel ratio.
-        page.set_zoom_level(1.0);
+        page.set_zoom_level(super::user_zoom());
         // 0 so the first real scale, including the startup one, is reported once.
         // The widget reads as 1 until the window is mapped onto a monitor.
         let seen = Rc::new(Cell::new(0));
@@ -245,7 +264,7 @@ mod linux_scale {
             return;
         }
         seen.set(next);
-        widget.set_zoom_level(1.0);
+        widget.set_zoom_level(super::user_zoom());
         widget.queue_resize();
         eprintln!("gaming_companion: {}", monitor_line(widget));
     }
@@ -346,8 +365,8 @@ fn origin_to_restore(frame: &WindowFrame) -> Option<(f64, f64)> {
 }
 
 fn apply_presentation(window: &tao::window::Window, config: &AppConfig) {
-    // The title bar is gone. Quit lives on the tray icon, and Move / Size
-    // drag the borderless window.
+    // No system title bar and no system border. The black border around the
+    // page moves and resizes the window. Quit lives on the tray icon.
     window.set_decorations(false);
     // The hotkey hides the sheet. While it is visible it stays above the game.
     window.set_always_on_top(true);
@@ -398,10 +417,10 @@ fn monitor_area(window: &tao::window::Window) -> Option<(f64, f64, f64, f64)> {
     }
 }
 
-/// The outer ring of an overlay is transparent and ignores the pointer,
-/// so a hover just outside the sheet still reaches the game.
+/// The overlay's outer ring is transparent and ignores the pointer.
+/// The black border sits inside that ring, so it still moves and resizes.
 fn pass_margin(window: &tao::window::Window, overlay: bool) {
-    const MARGIN: i32 = 16;
+    let margin_px = crate::chrome::MARGIN;
     #[cfg(target_os = "linux")]
     {
         use gtk::prelude::WidgetExt;
@@ -412,14 +431,14 @@ fn pass_margin(window: &tao::window::Window, overlay: bool) {
             return;
         }
         let alloc = gtk_window.allocation();
-        let width = alloc.width() - MARGIN * 2;
-        let height = alloc.height() - MARGIN * 2;
+        let width = alloc.width() - margin_px * 2;
+        let height = alloc.height() - margin_px * 2;
         if width < 200 || height < 200 {
             gtk_window.input_shape_combine_region(None);
             return;
         }
         let region = gtk::cairo::Region::create_rectangle(&gtk::cairo::RectangleInt::new(
-            MARGIN, MARGIN, width, height,
+            margin_px, margin_px, width, height,
         ));
         gtk_window.input_shape_combine_region(Some(&region));
     }
@@ -428,7 +447,7 @@ fn pass_margin(window: &tao::window::Window, overlay: bool) {
         use tao::platform::windows::WindowExtWindows;
         let scale = window.scale_factor();
         let size = window.inner_size();
-        let margin = (MARGIN as f64 * scale).round() as i32;
+        let margin = (margin_px as f64 * scale).round() as i32;
         let width = size.width as i32 - margin * 2;
         let height = size.height as i32 - margin * 2;
         unsafe {
@@ -463,23 +482,270 @@ unsafe extern "system" {
     fn DeleteObject(object: *mut core::ffi::c_void) -> i32;
 }
 
+/// Overlay on or off. Windows hit-testing reads this while the pointer moves.
+static OVERLAY: AtomicBool = AtomicBool::new(false);
+
+thread_local! {
+    /// Page zoom, separate from the monitor scale. Linux resets WebKit's zoom
+    /// when the widget scale changes, and this is what it puts back.
+    static USER_ZOOM: std::cell::Cell<f64> = const { std::cell::Cell::new(1.0) };
+}
+
+#[cfg(target_os = "linux")]
+fn user_zoom() -> f64 {
+    USER_ZOOM.with(std::cell::Cell::get)
+}
+
+fn set_user_zoom(zoom: f64) {
+    USER_ZOOM.with(|cell| cell.set(zoom));
+}
+
+fn install_chrome(window: &tao::window::Window, webview: &wry::WebView) {
+    #[cfg(target_os = "linux")]
+    install_linux_chrome(window, webview);
+    #[cfg(windows)]
+    {
+        let _ = webview;
+        install_windows_chrome(window);
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
+    {
+        let _ = (window, webview);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn install_linux_chrome(window: &tao::window::Window, webview: &wry::WebView) {
+    use gtk::prelude::{GtkWindowExt, WidgetExt, WidgetExtManual};
+    use tao::platform::unix::WindowExtUnix;
+    use wry::WebViewExtUnix;
+
+    // The border widgets own move and resize. A click on the page stays on
+    // the page. Ctrl+left still moves, using the click's own screen position
+    // and time. The page's local position is not the window's.
+    use webkit2gtk::WebViewExt;
+
+    let gtk_window = window.gtk_window().clone();
+    let page = webview.webview();
+    let history = page.clone();
+    page.add_events(gtk::gdk::EventMask::BUTTON_PRESS_MASK);
+    page.connect_button_press_event(move |_, event| {
+        // GDK buttons 8 and 9 are browser back and forward. 4 and 5 are the wheel.
+        match event.button() {
+            8 => {
+                history.go_back();
+                return gtk::glib::Propagation::Stop;
+            }
+            9 => {
+                history.go_forward();
+                return gtk::glib::Propagation::Stop;
+            }
+            _ => {}
+        }
+        let ctrl = event.state().contains(gtk::gdk::ModifierType::CONTROL_MASK);
+        if event.button() != 1 || !ctrl {
+            return gtk::glib::Propagation::Proceed;
+        }
+        let (x, y) = event.root();
+        gtk_window.begin_move_drag(1, x.round() as i32, y.round() as i32, event.time());
+        gtk::glib::Propagation::Stop
+    });
+}
+
+#[cfg(windows)]
+fn install_windows_chrome(window: &tao::window::Window) {
+    use tao::platform::windows::WindowExtWindows;
+    unsafe {
+        SetWindowSubclass(
+            window.hwnd() as *mut core::ffi::c_void,
+            chrome_subclass,
+            1,
+            0,
+        );
+    }
+}
+
+#[cfg(windows)]
+unsafe extern "system" fn chrome_subclass(
+    hwnd: *mut core::ffi::c_void,
+    msg: u32,
+    wparam: usize,
+    lparam: isize,
+    id: usize,
+    data: usize,
+) -> isize {
+    let _ = data;
+    const WM_NCHITTEST: u32 = 0x0084;
+    const WM_NCLBUTTONDBLCLK: u32 = 0x00A3;
+    const WM_NCDESTROY: u32 = 0x0082;
+    const WM_SYSCOMMAND: u32 = 0x0112;
+    const SC_MAXIMIZE: usize = 0xF030;
+    unsafe {
+        if msg == WM_NCDESTROY {
+            RemoveWindowSubclass(hwnd, chrome_subclass, id);
+            return DefSubclassProc(hwnd, msg, wparam, lparam);
+        }
+        if msg == WM_NCLBUTTONDBLCLK || (msg == WM_SYSCOMMAND && (wparam & 0xFFF0) == SC_MAXIMIZE) {
+            return 0;
+        }
+        if msg == WM_NCHITTEST {
+            let mut point = Point {
+                x: lparam as i16 as i32,
+                y: (lparam >> 16) as i16 as i32,
+            };
+            let mut rect = Rect {
+                left: 0,
+                top: 0,
+                right: 0,
+                bottom: 0,
+            };
+            if ScreenToClient(hwnd, &mut point) != 0 && GetClientRect(hwnd, &mut rect) != 0 {
+                let mut dpi = GetDpiForWindow(hwnd) as i32;
+                if dpi <= 0 {
+                    dpi = 96;
+                }
+                let ctrl = GetKeyState(0x11) < 0;
+                let overlay = OVERLAY.load(Ordering::Relaxed);
+                let decision = crate::chrome::hit(
+                    rect.right,
+                    rect.bottom,
+                    point.x,
+                    point.y,
+                    ctrl,
+                    overlay,
+                    dpi,
+                    96,
+                );
+                if matches!(decision, crate::chrome::Hit::Move)
+                    && crate::chrome::settings_target(
+                        rect.right,
+                        rect.bottom,
+                        point.x,
+                        point.y,
+                        overlay,
+                        dpi,
+                        96,
+                    )
+                {
+                    return hit_code(crate::chrome::Hit::Client);
+                }
+                return hit_code(decision);
+            }
+        }
+        DefSubclassProc(hwnd, msg, wparam, lparam)
+    }
+}
+
+#[cfg(windows)]
+fn hit_code(hit: crate::chrome::Hit) -> isize {
+    match hit {
+        crate::chrome::Hit::Pass => -1,
+        crate::chrome::Hit::Client => 1,
+        crate::chrome::Hit::Move => 2,
+        crate::chrome::Hit::Resize(crate::chrome::Edge::West) => 10,
+        crate::chrome::Hit::Resize(crate::chrome::Edge::East) => 11,
+        crate::chrome::Hit::Resize(crate::chrome::Edge::North) => 12,
+        crate::chrome::Hit::Resize(crate::chrome::Edge::NorthWest) => 13,
+        crate::chrome::Hit::Resize(crate::chrome::Edge::NorthEast) => 14,
+        crate::chrome::Hit::Resize(crate::chrome::Edge::South) => 15,
+        crate::chrome::Hit::Resize(crate::chrome::Edge::SouthWest) => 16,
+        crate::chrome::Hit::Resize(crate::chrome::Edge::SouthEast) => 17,
+    }
+}
+
+#[cfg(windows)]
+#[repr(C)]
+struct Point {
+    x: i32,
+    y: i32,
+}
+
+#[cfg(windows)]
+#[repr(C)]
+struct Rect {
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+}
+
+#[cfg(windows)]
+#[link(name = "user32")]
+#[link(name = "comctl32")]
+unsafe extern "system" {
+    fn SetWindowSubclass(
+        hwnd: *mut core::ffi::c_void,
+        proc: unsafe extern "system" fn(
+            *mut core::ffi::c_void,
+            u32,
+            usize,
+            isize,
+            usize,
+            usize,
+        ) -> isize,
+        id: usize,
+        data: usize,
+    ) -> i32;
+    fn RemoveWindowSubclass(
+        hwnd: *mut core::ffi::c_void,
+        proc: unsafe extern "system" fn(
+            *mut core::ffi::c_void,
+            u32,
+            usize,
+            isize,
+            usize,
+            usize,
+        ) -> isize,
+        id: usize,
+    ) -> i32;
+    fn DefSubclassProc(
+        hwnd: *mut core::ffi::c_void,
+        msg: u32,
+        wparam: usize,
+        lparam: isize,
+    ) -> isize;
+    fn ScreenToClient(hwnd: *mut core::ffi::c_void, point: *mut Point) -> i32;
+    fn GetClientRect(hwnd: *mut core::ffi::c_void, rect: *mut Rect) -> i32;
+    fn GetKeyState(key: i32) -> i16;
+    fn GetDpiForWindow(hwnd: *mut core::ffi::c_void) -> u32;
+}
+
 fn build_webview<'a>(
     window: &'a tao::window::Window,
     web_context: &'a mut WebContext,
     page: &crate::model::Page,
+    catalog: Option<&str>,
+    plugins: &[Plugin],
+    active_plugin: &str,
     proxy: EventLoopProxy<ShellEvent>,
     hotkey: &str,
     system_confirms: bool,
     overlay: bool,
+    bindings: &crate::model::Bindings,
 ) -> Result<wry::WebView> {
+    #[cfg(target_os = "linux")]
+    let frame_proxy = proxy.clone();
+    let nav_proxy = proxy.clone();
     let mut builder = WebViewBuilder::new_with_web_context(web_context)
         .with_transparent(true)
         .with_ipc_handler(move |request: wry::http::Request<String>| {
-            let _ = proxy.send_event(ShellEvent::Ipc(request.into_body()));
+            let body = request.into_body();
+            let _ = proxy.send_event(ShellEvent::Ipc(body));
+        })
+        .with_on_page_load_handler(move |event, url| {
+            if let wry::PageLoadEvent::Finished = event {
+                let _ = nav_proxy.send_event(ShellEvent::Navigated(url));
+            }
         });
-    builder =
-        builder.with_initialization_script(settings::script(hotkey, system_confirms, overlay));
-    if let Some(script) = &page.init_script {
+    builder = builder.with_initialization_script(settings::script(
+        hotkey,
+        system_confirms,
+        overlay,
+        plugins,
+        active_plugin,
+        bindings,
+    ));
+    if let Some(script) = catalog {
         builder = builder.with_initialization_script(script);
     }
     if let Some(url) = &page.url {
@@ -497,8 +763,21 @@ fn build_webview<'a>(
         let vbox = window
             .default_vbox()
             .ok_or_else(|| Error::new("the window has no content area for the webview"))?;
+        let center = crate::frame::mount(
+            vbox,
+            window.gtk_window(),
+            hotkey,
+            &settings::hint(system_confirms),
+            overlay,
+            plugins,
+            active_plugin,
+            bindings,
+            move |body| {
+                let _ = frame_proxy.send_event(ShellEvent::Ipc(body));
+            },
+        );
         builder
-            .build_gtk(vbox)
+            .build_gtk(&center)
             .map_err(|err| Error::new(format!("opening webview: {err}")))?
     };
     #[cfg(not(target_os = "linux"))]
@@ -608,6 +887,7 @@ impl Grabber {
 struct Shell {
     config: AppConfig,
     config_file: PathBuf,
+    plugins: Vec<Plugin>,
     shown: bool,
     shortcut: String,
     live: bool,
@@ -616,6 +896,10 @@ struct Shell {
     /// First shortcut. Bound once the window can parent the confirm dialog.
     initial: Option<Hotkey>,
     bind_started: bool,
+    /// Page zoom. 1.0 is 100%. This is not the monitor scale.
+    zoom: f64,
+    /// The window currently fills the monitor. Config still holds the frame from before that.
+    filled: bool,
 }
 
 impl Shell {
@@ -625,6 +909,7 @@ impl Shell {
         hotkey: Hotkey,
         config: AppConfig,
         config_file: PathBuf,
+        plugins: Vec<Plugin>,
     ) -> Self {
         let shortcut = hotkey.canonical();
         let mut initial = None;
@@ -672,6 +957,7 @@ impl Shell {
         Self {
             config,
             config_file,
+            plugins,
             shown: true,
             shortcut,
             live,
@@ -679,6 +965,8 @@ impl Shell {
             host,
             initial,
             bind_started: false,
+            zoom: 1.0,
+            filled: false,
         }
     }
 
@@ -699,6 +987,10 @@ impl Shell {
                 );
             }
             ShellEvent::Ipc(body) => self.on_ipc(&body, window, webview),
+            ShellEvent::Navigated(url) => {
+                let _ = webview.zoom(self.zoom);
+                self.follow_url(&url, window, webview);
+            }
             ShellEvent::Bound(canonical) => self.accept(canonical, window, webview),
             ShellEvent::Failed(message) => {
                 self.status = message;
@@ -741,12 +1033,50 @@ impl Shell {
             self.toggle_overlay(window, webview);
             return;
         }
-        if body == "drag" {
-            let _ = window.drag_window();
+        if body == "back" {
+            let _ = webview.go_back();
             return;
         }
-        if body == "resize" {
-            let _ = window.drag_resize_window(ResizeDirection::SouthEast);
+        if body == "forward" {
+            let _ = webview.go_forward();
+            return;
+        }
+        if body == "reload" {
+            let _ = webview.reload();
+            return;
+        }
+        if body == "zoom-in" {
+            self.set_zoom(webview, self.zoom + 0.25);
+            return;
+        }
+        if body == "zoom-out" {
+            self.set_zoom(webview, self.zoom - 0.25);
+            return;
+        }
+        if body == "zoom-reset" {
+            self.set_zoom(webview, 1.0);
+            return;
+        }
+        if body == "fill" {
+            self.fill_toggle(window);
+            return;
+        }
+        if body == "escape" {
+            if self.filled {
+                self.restore_frame(window);
+            }
+            return;
+        }
+        if let Some(rest) = body.strip_prefix("bind:") {
+            self.bind_action(rest, window, webview);
+            return;
+        }
+        if let Some(id) = body.strip_prefix("open:") {
+            self.open_plugin(id.trim(), window, webview);
+            return;
+        }
+        if let Some(id) = body.strip_prefix("game:") {
+            self.open_game(id.trim(), window, webview);
             return;
         }
         let Some(text) = body.strip_prefix("set:") else {
@@ -761,6 +1091,11 @@ impl Shell {
             }
         };
         let canonical = parsed.canonical();
+        if let Err(err) = self.config.bindings.check(&canonical) {
+            self.status = err.to_string();
+            self.push(webview);
+            return;
+        }
         if self.live && canonical == self.shortcut {
             self.status = "Saved".to_string();
             self.push(webview);
@@ -775,6 +1110,8 @@ impl Shell {
                     &self.status,
                     self.config.overlay,
                 ));
+                #[cfg(target_os = "linux")]
+                crate::frame::apply(&canonical, &self.status, self.config.overlay);
             }
             BindResult::Failed(message) => {
                 self.status = message;
@@ -799,11 +1136,168 @@ impl Shell {
             &self.status,
             self.config.overlay,
         ));
+        #[cfg(target_os = "linux")]
+        {
+            crate::frame::apply(&self.shortcut, &self.status, self.config.overlay);
+            crate::frame::show_bindings(&self.config.bindings);
+        }
+        let _ = webview.evaluate_script(&settings::bindings_call(&self.config.bindings));
+        self.mark(webview);
+    }
+
+    fn mark(&self, webview: &wry::WebView) {
+        let _ = webview.evaluate_script(&settings::select_call(&self.config.active_plugin));
+        #[cfg(target_os = "linux")]
+        crate::frame::select(&self.config.active_plugin);
+    }
+
+    fn open_game(&mut self, game_id: &str, window: &tao::window::Window, webview: &wry::WebView) {
+        if self
+            .plugins
+            .iter()
+            .any(|plugin| plugin.id == self.config.active_plugin && plugin.game_id == game_id)
+        {
+            return;
+        }
+        let Some(id) = self
+            .plugins
+            .iter()
+            .find(|plugin| plugin.game_id == game_id)
+            .map(|plugin| plugin.id.clone())
+        else {
+            return;
+        };
+        self.open_plugin(&id, window, webview);
+    }
+
+    fn open_plugin(&mut self, id: &str, window: &tao::window::Window, webview: &wry::WebView) {
+        if id == self.config.active_plugin {
+            return;
+        }
+        let Some(plugin) = self.plugins.iter().find(|plugin| plugin.id == id).cloned() else {
+            return;
+        };
+        let Some(resource) = plugin.resource(&plugin.entry).cloned() else {
+            return;
+        };
+        let page = match prepare_page(&plugin, &resource) {
+            Ok(page) => page,
+            Err(err) => {
+                eprintln!("gaming_companion: {err}");
+                return;
+            }
+        };
+        self.config.active_plugin = plugin.id.clone();
+        self.config.active_resource = Some(resource.id.clone());
+        self.persist();
+        window.set_title(&page.title);
+        let loaded = if let Some(url) = page.url.as_deref() {
+            webview.load_url(url)
+        } else if let Some(html) = page.html.as_deref() {
+            webview.load_html(html)
+        } else {
+            eprintln!("gaming_companion: page has neither a url nor html");
+            self.mark(webview);
+            return;
+        };
+        if let Err(err) = loaded {
+            eprintln!("gaming_companion: {err}");
+        }
+        self.mark(webview);
+        eprintln!("gaming_companion: {} ({})", page.title, plugin.id);
+    }
+
+    fn follow_url(&mut self, url: &str, window: &tao::window::Window, webview: &wry::WebView) {
+        let found = matching_resource(&self.plugins, url).map(|(plugin, resource)| {
+            (
+                plugin.id.clone(),
+                plugin.name.clone(),
+                resource.id.clone(),
+                resource.title.clone(),
+            )
+        });
+        if let Some((id, name, resource_id, title)) = found {
+            let changed = self.config.active_plugin != id
+                || self.config.active_resource.as_deref() != Some(resource_id.as_str());
+            if changed {
+                let title = format!("{name} - {title}");
+                self.config.active_plugin = id.clone();
+                self.config.active_resource = Some(resource_id);
+                window.set_title(&title);
+                self.persist();
+                eprintln!("gaming_companion: {title} ({id})");
+            }
+        }
+        self.mark(webview);
+    }
+
+    fn set_zoom(&mut self, webview: &wry::WebView, zoom: f64) {
+        self.zoom = zoom.clamp(0.5, 3.0);
+        set_user_zoom(self.zoom);
+        let _ = webview.zoom(self.zoom);
+    }
+
+    fn fill_toggle(&mut self, window: &tao::window::Window) {
+        if self.filled {
+            self.restore_frame(window);
+            return;
+        }
+        let Some((x, y, width, height)) = monitor_area(window) else {
+            return;
+        };
+        remember_frame(window, &mut self.config);
+        self.filled = true;
+        window.set_outer_position(LogicalPosition::new(x, y));
+        window.set_inner_size(LogicalSize::new(width, height));
+        #[cfg(target_os = "linux")]
+        crate::gnome_pin::schedule_place(x, y);
+        self.persist();
+        eprintln!("gaming_companion: fill");
+    }
+
+    fn restore_frame(&mut self, window: &tao::window::Window) {
+        self.filled = false;
+        apply_presentation(window, &self.config);
+        eprintln!("gaming_companion: restore");
+    }
+
+    fn bind_action(&mut self, rest: &str, window: &tao::window::Window, webview: &wry::WebView) {
+        let Some((id, chord)) = rest.split_once(':') else {
+            return;
+        };
+        let Some(action) = Action::from_id(id) else {
+            return;
+        };
+        let canon = match bindings::normalized(chord.trim()) {
+            Ok(value) => value,
+            Err(err) => {
+                self.status = err.to_string();
+                self.push(webview);
+                return;
+            }
+        };
+        let mut next = self.config.bindings.clone();
+        next.set(action, &canon);
+        if let Err(err) = next.check(&self.config.hotkey) {
+            self.status = err.to_string();
+            self.push(webview);
+            return;
+        }
+        self.config.bindings = next;
+        self.status = "Saved".to_string();
+        self.save(window);
+        self.push(webview);
     }
 
     fn toggle_overlay(&mut self, window: &tao::window::Window, webview: &wry::WebView) {
-        remember_frame(window, &mut self.config);
+        if !self.filled {
+            remember_frame(window, &mut self.config);
+        }
+        self.filled = false;
         self.config.overlay = !self.config.overlay;
+        OVERLAY.store(self.config.overlay, Ordering::Relaxed);
+        #[cfg(target_os = "linux")]
+        crate::frame::set_overlay(self.config.overlay);
         if self.config.overlay
             && self.config.overlay_window.is_none()
             && let Some((x, y, width, height)) = monitor_area(window)
@@ -847,7 +1341,9 @@ impl Shell {
     }
 
     fn save(&mut self, window: &tao::window::Window) {
-        remember_frame(window, &mut self.config);
+        if !self.filled {
+            remember_frame(window, &mut self.config);
+        }
         self.persist();
     }
 }

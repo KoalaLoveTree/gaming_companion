@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+use super::bindings::Bindings;
 use super::hotkey;
 use crate::{Error, Result};
 
@@ -67,6 +68,9 @@ pub struct AppConfig {
     /// Saved overlay size. Absent until the panel has been opened once.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub overlay_window: Option<WindowFrame>,
+    /// Page shortcuts. Show or hide stays in `hotkey`.
+    #[serde(default)]
+    pub bindings: Bindings,
 }
 
 fn default_hotkey() -> String {
@@ -82,6 +86,7 @@ impl Default for AppConfig {
             window: WindowFrame::default(),
             overlay: false,
             overlay_window: None,
+            bindings: Bindings::default(),
         }
     }
 }
@@ -154,6 +159,7 @@ impl AppConfig {
                 return Err(Error::new("config overlay position is invalid"));
             }
         }
+        self.bindings.check(&self.hotkey)?;
         Ok(())
     }
 }
@@ -181,6 +187,7 @@ mod tests {
             },
             overlay: false,
             overlay_window: None,
+            bindings: Bindings::default(),
         };
         let parsed = AppConfig::parse(&config.to_toml().unwrap()).unwrap();
         assert_eq!(parsed, config);
@@ -260,6 +267,19 @@ mod tests {
         let parsed = AppConfig::parse(&config.to_toml().unwrap()).unwrap();
         assert!(parsed.window.placed);
         assert_eq!(parsed.window.x, Some(0.0));
+    }
+
+    #[test]
+    fn a_missing_keymap_uses_the_page_defaults() {
+        let parsed = AppConfig::parse("active_plugin = \"sample\"\n").unwrap();
+        assert_eq!(parsed.bindings, Bindings::default());
+    }
+
+    #[test]
+    fn a_page_shortcut_that_repeats_show_or_hide_is_rejected() {
+        let text = "active_plugin = \"sample\"\nhotkey = \"alt+left\"\n";
+        let err = AppConfig::parse(text).unwrap_err();
+        assert!(err.to_string().contains("Already used by Show or hide"));
     }
 
     #[test]

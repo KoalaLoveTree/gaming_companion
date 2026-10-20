@@ -22,6 +22,10 @@ pub struct Resource {
 pub struct Plugin {
     pub id: String,
     pub name: String,
+    /// Folder that groups this plugin with the others for the same game.
+    /// A plugin that sits directly in the plugins directory uses its own id.
+    pub game_id: String,
+    pub game_name: String,
     pub entry: String,
     pub root: std::path::PathBuf,
     pub resources: Vec<Resource>,

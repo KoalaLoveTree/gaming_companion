@@ -7,6 +7,7 @@ use crate::model::{Page, Plugin, Resource, ResourceKind};
 pub fn prepare_page(plugin: &Plugin, resource: &Resource) -> Result<Page> {
     let init_script = init_script(plugin, resource)?;
     let title = format!("{} - {}", plugin.name, resource.title);
+    let css = css_text(plugin, resource)?;
     match resource.kind {
         ResourceKind::Url => Ok(Page {
             title,
@@ -16,17 +17,25 @@ pub fn prepare_page(plugin: &Plugin, resource: &Resource) -> Result<Page> {
         }),
         ResourceKind::Html => {
             let path = resolve_inside(&plugin.root, &resource.src)?;
+            let mut html = read_limited(&path)?;
+            if let Some(css) = css {
+                html = embed_style(&html, &css);
+            }
             Ok(Page {
                 title,
                 url: None,
-                html: Some(read_limited(&path)?),
+                html: Some(html),
                 init_script,
             })
         }
         ResourceKind::Markdown => {
             let path = resolve_inside(&plugin.root, &resource.src)?;
             let markdown = read_limited(&path)?;
-            let html = Some(markdown_document(&title, &markdown));
+            let html = Some(markdown_document(
+                &title,
+                &markdown,
+                css.as_deref().unwrap_or(""),
+            ));
             Ok(Page {
                 title,
                 url: None,
@@ -37,7 +46,62 @@ pub fn prepare_page(plugin: &Plugin, resource: &Resource) -> Result<Page> {
     }
 }
 
-fn init_script(plugin: &Plugin, resource: &Resource) -> Result<Option<String>> {
+/// Document-start script for every URL resource that injects CSS.
+/// It runs on each navigation and applies the sheet only when the address matches.
+pub fn catalog_script(plugins: &[Plugin]) -> Result<Option<String>> {
+    let mut rules = Vec::new();
+    for plugin in plugins {
+        for resource in &plugin.resources {
+            if resource.kind != ResourceKind::Url {
+                continue;
+            }
+            let Some(css) = css_text(plugin, resource)? else {
+                continue;
+            };
+            rules.push(format!(
+                "{{src:{},css:{}}}",
+                js_quote(&resource.src),
+                js_quote(&css)
+            ));
+        }
+    }
+    if rules.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(format!(
+        "(function(){{var rules=[{}];var href=String(location.href||'');for(var i=0;i<rules.length;i++){{var src=rules[i].src;if(href!==src&&href.indexOf(src+'/')!==0&&href.indexOf(src+'?')!==0&&href.indexOf(src+'#')!==0)continue;var s=document.createElement('style');s.setAttribute('data-gaming-companion','inject');s.textContent=rules[i].css;(document.head||document.documentElement).appendChild(s);return;}}}})();",
+        rules.join(",")
+    )))
+}
+
+/// The URL resource whose address is the longest match for `url`.
+pub fn matching_resource<'a>(
+    plugins: &'a [Plugin],
+    url: &str,
+) -> Option<(&'a Plugin, &'a Resource)> {
+    let mut best: Option<(&Plugin, &Resource, usize)> = None;
+    for plugin in plugins {
+        for resource in &plugin.resources {
+            if resource.kind != ResourceKind::Url || !url_matches(&resource.src, url) {
+                continue;
+            }
+            let len = resource.src.len();
+            if best.as_ref().is_none_or(|(_, _, known)| len > *known) {
+                best = Some((plugin, resource, len));
+            }
+        }
+    }
+    best.map(|(plugin, resource, _)| (plugin, resource))
+}
+
+fn url_matches(src: &str, url: &str) -> bool {
+    url == src
+        || url.starts_with(&format!("{src}/"))
+        || url.starts_with(&format!("{src}?"))
+        || url.starts_with(&format!("{src}#"))
+}
+
+fn css_text(plugin: &Plugin, resource: &Resource) -> Result<Option<String>> {
     if resource.inject.is_empty() {
         return Ok(None);
     }
@@ -47,22 +111,53 @@ fn init_script(plugin: &Plugin, resource: &Resource) -> Result<Option<String>> {
         css.push_str(&read_limited(&path)?);
         css.push('\n');
     }
+    Ok(Some(css))
+}
+
+fn init_script(plugin: &Plugin, resource: &Resource) -> Result<Option<String>> {
+    let Some(css) = css_text(plugin, resource)? else {
+        return Ok(None);
+    };
     Ok(Some(format!(
         "(function(){{var s=document.createElement('style');s.setAttribute('data-gaming-companion','inject');s.textContent={};(document.head||document.documentElement).appendChild(s);}})();",
         js_quote(&css)
     )))
 }
 
-fn markdown_document(title: &str, markdown: &str) -> String {
+fn embed_style(html: &str, css: &str) -> String {
+    let tag = format!(
+        "<style data-gaming-companion=\"inject\">{}</style>",
+        css.replace("</style", "<\\/style")
+    );
+    let lower = html.to_ascii_lowercase();
+    if let Some(index) = lower.find("</head>") {
+        let mut out = String::new();
+        out.push_str(&html[..index]);
+        out.push_str(&tag);
+        out.push_str(&html[index..]);
+        return out;
+    }
+    format!("{tag}{html}")
+}
+
+fn markdown_document(title: &str, markdown: &str, css: &str) -> String {
     let mut body = String::new();
     let parser = Parser::new_ext(
         markdown,
         Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH,
     );
     html::push_html(&mut body, parser);
+    let extra = if css.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "<style data-gaming-companion=\"inject\">{}</style>",
+            css.replace("</style", "<\\/style")
+        )
+    };
     format!(
         "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>{}</title>\
-<style>body{{font:16px/1.45 sans-serif;margin:24px;background:#161616;color:#eee}}a{{color:#8cf}}</style>\
+{extra}<style>body{{font:16px/1.45 sans-serif;margin:24px;background:#161616;color:#eee}}a{{color:#8cf}}</style>\
 </head><body>{}</body></html>",
         html_escape(title),
         body

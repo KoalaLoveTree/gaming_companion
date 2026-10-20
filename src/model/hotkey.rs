@@ -421,7 +421,7 @@ fn key_token(raw: &str) -> Result<Key> {
         "left" => Key::Left,
         "right" => Key::Right,
         "minus" => Key::Minus,
-        "equal" => Key::Equal,
+        "equal" | "plus" | "kpadd" | "add" => Key::Equal,
         "comma" => Key::Comma,
         "period" => Key::Period,
         "slash" => Key::Slash,
@@ -476,6 +476,13 @@ mod tests {
         assert_eq!(typed, portal);
         assert_eq!(typed.canonical(), "ctrl+shift+a");
         assert_eq!(typed.portal_trigger(), "<Control><Shift>a");
+    }
+
+    #[test]
+    fn plus_is_the_equal_key() {
+        assert_eq!(parse("ctrl+plus").unwrap().canonical(), "ctrl+equal");
+        assert_eq!(parse("ctrl+kpadd").unwrap(), parse("ctrl+equal").unwrap());
+        assert_eq!(parse("ctrl+add").unwrap().canonical(), "ctrl+equal");
     }
 
     #[test]

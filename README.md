@@ -4,7 +4,7 @@ A hotkey shows a sheet beside or over a game. The app is one external process. I
 
 Plugins are folders on disk. They live in [gaming-companion-plugins](https://github.com/KoalaLoveTree/gaming-companion-plugins). The OS webview loads the page. No plugin ships with the app. Behavior is specified in [SPEC.md](SPEC.md).
 
-The window has no title bar. Move and Size sit at the bottom right. The tray menu has Show or hide, and Quit. A fresh machine uses `Ctrl+Alt+Space`. Change that in Settings. Exclusive fullscreen covers the sheet, so the game needs borderless windowed mode.
+The window has no title bar and no system border. A solid gray border resizes it, and a light line marks the inner edge of that border. The darker bar above the page moves the window. Plugins, on the left of that bar, opens the list of games and plugins. Settings, on the right, opens the shortcuts. Back, forward, reload, zoom, and fill screen are shortcuts while the sheet is focused. The side mouse buttons go back and forward. F11 fills the monitor and Esc restores that frame. A second light line shows where the page starts. Ctrl plus the left button moves it from the page. The same border is there in overlay mode, inside a transparent ring the pointer ignores. The tray menu has Show or hide, and Quit. A fresh machine uses `Ctrl+Alt+Space`. Change that in Settings. Exclusive fullscreen covers the sheet, so the game needs borderless windowed mode.
 
 ## Build
 
@@ -59,6 +59,16 @@ src = "notes.md"
 ```
 
 `kind` is `url`, `html`, or `markdown`. `entry` names the resource that opens first. `inject` lists CSS files inside the plugin folder. A path that leaves the folder is rejected. Adding or editing a plugin does not require a rebuild.
+
+Plugins for one game can share a folder. Each plugin is still its own directory with `plugin.toml`, so deleting that directory removes only that plugin. `game.toml` in the game folder sets the name the list shows:
+
+```text
+plugins/arc-raiders/game.toml
+plugins/arc-raiders/loot/plugin.toml
+plugins/arc-raiders/maps/plugin.toml
+```
+
+A folder that itself contains `plugin.toml` is one plugin. Plugins, on the left of the top bar, lists each game and the plugins under it.
 
 The app exits when it has no plugin to open.
 
