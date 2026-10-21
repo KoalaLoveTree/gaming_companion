@@ -16,7 +16,7 @@ A resource is a remote URL, a local HTML file, or Markdown. A URL may inject CSS
 
 The window has no title bar and no system border. An opaque border drawn by the app surrounds the page. A light line marks the inner edge of that border. The outer 6px of each edge, including the corners, resizes the window. The top of that border is 38px: its outer edge resizes, and the rest is a darker bar that moves the window. A light line under that bar is where the page starts. A small emblem marks the move area. Ctrl plus the left button moves the sheet from the page. Plugins is a button on the left of that bar. It opens a list of games and the plugins in each game, and the open plugin is marked. Settings is a button on the right. It opens the shortcut list. A new shortcut is recorded with Change, then Save.
 
-The tray menu has Show or hide, and Quit. Quit saves and exits. The Settings Close button only hides that list. Alt+F4 also quits.
+The tray menu has Show or hide, and Quit. Quit saves and exits. The Settings Close button only hides that list. Alt+F4 also quits. The tray and the task switcher show a sheet beside a screen.
 
 One shortcut shows and hides the sheet. Hide does not reload the page and leaves the window where the user put it. Clicking the game does not hide the sheet and does not quit. Showing the sheet does not take focus.
 

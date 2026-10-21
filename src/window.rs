@@ -22,6 +22,15 @@ use crate::model::hotkey::{self, Hotkey};
 use crate::settings;
 use crate::{Error, Result};
 
+fn sheet_icon() -> Option<tao::window::Icon> {
+    tao::window::Icon::from_rgba(
+        crate::mark::pixels(crate::mark::SWITCHER),
+        crate::mark::SWITCHER,
+        crate::mark::SWITCHER,
+    )
+    .ok()
+}
+
 enum ShellEvent {
     /// `activation_token` comes from the Wayland shortcut portal. It is what
     /// lets a global hotkey focus this window again. Other platforms send none.
@@ -90,7 +99,8 @@ pub fn launch() -> Result<()> {
         .with_transparent(true)
         .with_decorations(false)
         .with_always_on_top(true)
-        .with_focused(!shell.config.overlay);
+        .with_focused(!shell.config.overlay)
+        .with_window_icon(sheet_icon());
     if let Some((x, y)) = origin_to_restore(&startup) {
         builder = builder.with_position(LogicalPosition::new(x, y));
     }

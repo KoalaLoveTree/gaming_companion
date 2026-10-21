@@ -20,7 +20,11 @@ where
         return None;
     }
 
-    let Ok(icon) = Icon::from_rgba(icon_pixels(), 32, 32) else {
+    let Ok(icon) = Icon::from_rgba(
+        crate::mark::pixels(crate::mark::TRAY),
+        crate::mark::TRAY,
+        crate::mark::TRAY,
+    ) else {
         eprintln!("gaming_companion: the tray icon could not be built");
         return None;
     };
@@ -49,30 +53,4 @@ where
             None
         }
     }
-}
-
-fn icon_pixels() -> Vec<u8> {
-    const SIZE: usize = 32;
-    let mut pixels = vec![0u8; SIZE * SIZE * 4];
-    for y in 0..SIZE {
-        for x in 0..SIZE {
-            let index = (y * SIZE + x) * 4;
-            if x < 2 || y < 2 || x >= SIZE - 2 || y >= SIZE - 2 {
-                continue;
-            }
-            pixels[index] = 28;
-            pixels[index + 1] = 28;
-            pixels[index + 2] = 32;
-            pixels[index + 3] = 255;
-            let row = matches!(y, 9 | 10 | 15 | 16 | 21 | 22) && (8..24).contains(&x);
-            let mark = matches!(x, 8 | 9) && (8..23).contains(&y);
-            if row || mark {
-                pixels[index] = 236;
-                pixels[index + 1] = 236;
-                pixels[index + 2] = 236;
-                pixels[index + 3] = 255;
-            }
-        }
-    }
-    pixels
 }

@@ -83,21 +83,29 @@ fn write_desktop_file() -> Result<()> {
         .ok_or_else(|| Error::new("could not find a user data directory"))?
         .join("applications");
     std::fs::create_dir_all(&dir)?;
+    let icon_path = dir.join(format!("{APP_ID}.png"));
+    std::fs::write(&icon_path, crate::mark::png(crate::mark::SWITCHER))
+        .map_err(|err| Error::new(format!("writing {}: {err}", icon_path.display())))?;
     let exe = std::env::current_exe()?;
-    let text = format!(
+    let text = desktop_entry(&quote_exec(&exe), &icon_path);
+    let path = dir.join(format!("{APP_ID}.desktop"));
+    std::fs::write(&path, text)
+        .map_err(|err| Error::new(format!("writing {}: {err}", path.display())))?;
+    Ok(())
+}
+
+fn desktop_entry(exec: &str, icon: &Path) -> String {
+    format!(
         "[Desktop Entry]\n\
          Name=Gaming Companion\n\
          Comment=Show and hide the gaming companion\n\
          Type=Application\n\
          Terminal=false\n\
-         StartupWMClass=com.gamingcompanion.Companion\n\
-         Exec={}\n",
-        quote_exec(&exe)
-    );
-    let path = dir.join(format!("{APP_ID}.desktop"));
-    std::fs::write(&path, text)
-        .map_err(|err| Error::new(format!("writing {}: {err}", path.display())))?;
-    Ok(())
+         StartupWMClass={APP_ID}\n\
+         Icon={}\n\
+         Exec={exec}\n",
+        icon.display()
+    )
 }
 
 fn quote_exec(path: &Path) -> String {
@@ -666,7 +674,9 @@ fn press_text(arg: &dyn RefArg, depth: u8) -> Option<Hotkey> {
 
 #[cfg(test)]
 mod tests {
-    use super::stored_shortcut_value;
+    use std::path::Path;
+
+    use super::{desktop_entry, stored_shortcut_value};
     use crate::model::hotkey;
 
     #[test]
@@ -676,5 +686,17 @@ mod tests {
             stored_shortcut_value(&hotkey),
             "[('toggle', {'shortcuts': <['<Control><Alt>space']>, 'description': <'Show or hide Gaming Companion'>})]"
         );
+    }
+
+    #[test]
+    fn the_desktop_entry_names_the_icon() {
+        let icon =
+            Path::new("/home/me/.local/share/applications/com.gamingcompanion.Companion.png");
+        let text = desktop_entry("/usr/bin/gaming_companion", icon);
+        assert!(text.contains(
+            "Icon=/home/me/.local/share/applications/com.gamingcompanion.Companion.png\n"
+        ));
+        assert!(text.contains("StartupWMClass=com.gamingcompanion.Companion\n"));
+        assert!(text.contains("Exec=/usr/bin/gaming_companion\n"));
     }
 }

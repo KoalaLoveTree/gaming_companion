@@ -15,6 +15,8 @@ mod gnome_pin;
 mod portal;
 
 #[cfg(feature = "window")]
+mod mark;
+#[cfg(feature = "window")]
 mod tray;
 #[cfg(feature = "window")]
 mod window;
