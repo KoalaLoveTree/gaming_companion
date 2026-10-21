@@ -3,7 +3,7 @@
 //! Show or hide stays on [`super::config::AppConfig::hotkey`]. It is the only
 //! shortcut that works while the game is focused. These chords do not.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use super::hotkey::{self, Hotkey, Key};
 use crate::{Error, Result};
@@ -30,12 +30,16 @@ impl Action {
         Action::Fill,
     ];
 
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    pub fn index(self) -> usize {
-        Self::ALL
-            .iter()
-            .position(|action| *action == self)
-            .unwrap_or(0)
+    pub const fn index(self) -> usize {
+        match self {
+            Action::Back => 0,
+            Action::Forward => 1,
+            Action::Reload => 2,
+            Action::ZoomIn => 3,
+            Action::ZoomOut => 4,
+            Action::ZoomReset => 5,
+            Action::Fill => 6,
+        }
     }
 
     pub fn id(self) -> &'static str {
@@ -67,84 +71,120 @@ impl Action {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Page shortcuts, in [`Action::ALL`] order.
+///
+/// `config.toml` still stores one named field per action (`back`, `zoom_in`, …).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Bindings {
-    #[serde(default = "back_default")]
-    pub back: String,
-    #[serde(default = "forward_default")]
-    pub forward: String,
-    #[serde(default = "reload_default")]
-    pub reload: String,
-    #[serde(default = "zoom_in_default")]
-    pub zoom_in: String,
-    #[serde(default = "zoom_out_default")]
-    pub zoom_out: String,
-    #[serde(default = "zoom_reset_default")]
-    pub zoom_reset: String,
-    #[serde(default = "fill_default")]
-    pub fill: String,
+    chords: [String; 7],
 }
 
-fn back_default() -> String {
-    "alt+left".to_string()
+const DEFAULTS: [&str; 7] = [
+    "alt+left",
+    "alt+right",
+    "ctrl+r",
+    "ctrl+equal",
+    "ctrl+minus",
+    "ctrl+0",
+    "f11",
+];
+
+/// The on-disk shape. Field names are the config file.
+#[derive(Serialize, Deserialize)]
+struct StoredBindings {
+    #[serde(default = "default_back")]
+    back: String,
+    #[serde(default = "default_forward")]
+    forward: String,
+    #[serde(default = "default_reload")]
+    reload: String,
+    #[serde(default = "default_zoom_in")]
+    zoom_in: String,
+    #[serde(default = "default_zoom_out")]
+    zoom_out: String,
+    #[serde(default = "default_zoom_reset")]
+    zoom_reset: String,
+    #[serde(default = "default_fill")]
+    fill: String,
 }
-fn forward_default() -> String {
-    "alt+right".to_string()
+
+fn default_back() -> String {
+    DEFAULTS[Action::Back.index()].to_string()
 }
-fn reload_default() -> String {
-    "ctrl+r".to_string()
+fn default_forward() -> String {
+    DEFAULTS[Action::Forward.index()].to_string()
 }
-fn zoom_in_default() -> String {
-    "ctrl+equal".to_string()
+fn default_reload() -> String {
+    DEFAULTS[Action::Reload.index()].to_string()
 }
-fn zoom_out_default() -> String {
-    "ctrl+minus".to_string()
+fn default_zoom_in() -> String {
+    DEFAULTS[Action::ZoomIn.index()].to_string()
 }
-fn zoom_reset_default() -> String {
-    "ctrl+0".to_string()
+fn default_zoom_out() -> String {
+    DEFAULTS[Action::ZoomOut.index()].to_string()
 }
-fn fill_default() -> String {
-    "f11".to_string()
+fn default_zoom_reset() -> String {
+    DEFAULTS[Action::ZoomReset.index()].to_string()
+}
+fn default_fill() -> String {
+    DEFAULTS[Action::Fill.index()].to_string()
+}
+
+impl StoredBindings {
+    fn from_bindings(bindings: &Bindings) -> Self {
+        Self {
+            back: bindings.chord(Action::Back).to_string(),
+            forward: bindings.chord(Action::Forward).to_string(),
+            reload: bindings.chord(Action::Reload).to_string(),
+            zoom_in: bindings.chord(Action::ZoomIn).to_string(),
+            zoom_out: bindings.chord(Action::ZoomOut).to_string(),
+            zoom_reset: bindings.chord(Action::ZoomReset).to_string(),
+            fill: bindings.chord(Action::Fill).to_string(),
+        }
+    }
+
+    fn into_bindings(self) -> Bindings {
+        Bindings {
+            chords: [
+                self.back,
+                self.forward,
+                self.reload,
+                self.zoom_in,
+                self.zoom_out,
+                self.zoom_reset,
+                self.fill,
+            ],
+        }
+    }
+}
+
+impl Serialize for Bindings {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        StoredBindings::from_bindings(self).serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for Bindings {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        StoredBindings::deserialize(deserializer).map(StoredBindings::into_bindings)
+    }
 }
 
 impl Default for Bindings {
     fn default() -> Self {
         Self {
-            back: back_default(),
-            forward: forward_default(),
-            reload: reload_default(),
-            zoom_in: zoom_in_default(),
-            zoom_out: zoom_out_default(),
-            zoom_reset: zoom_reset_default(),
-            fill: fill_default(),
+            chords: DEFAULTS.map(str::to_string),
         }
     }
 }
 
 impl Bindings {
     pub fn chord(&self, action: Action) -> &str {
-        match action {
-            Action::Back => &self.back,
-            Action::Forward => &self.forward,
-            Action::Reload => &self.reload,
-            Action::ZoomIn => &self.zoom_in,
-            Action::ZoomOut => &self.zoom_out,
-            Action::ZoomReset => &self.zoom_reset,
-            Action::Fill => &self.fill,
-        }
+        &self.chords[action.index()]
     }
 
     pub fn set(&mut self, action: Action, chord: &str) {
-        let slot = match action {
-            Action::Back => &mut self.back,
-            Action::Forward => &mut self.forward,
-            Action::Reload => &mut self.reload,
-            Action::ZoomIn => &mut self.zoom_in,
-            Action::ZoomOut => &mut self.zoom_out,
-            Action::ZoomReset => &mut self.zoom_reset,
-            Action::Fill => &mut self.fill,
-        };
-        *slot = chord.to_string();
+        self.chords[action.index()] = chord.to_string();
     }
 
     /// Each chord parses, none repeat, and none steal Show or hide or F5.
@@ -193,7 +233,7 @@ pub fn display(canonical: &str) -> String {
 
 /// Bare F5 always reloads. It is not a shortcut someone can rebind.
 pub fn reserved_reload(hotkey: &Hotkey) -> bool {
-    matches!(hotkey.key, Key::F(5))
+    matches!(hotkey.key, Key::F(key) if key.number() == 5)
         && !hotkey.ctrl
         && !hotkey.alt
         && !hotkey.shift
@@ -244,9 +284,12 @@ mod tests {
     fn defaults_parse_and_do_not_repeat_show_or_hide() {
         let bindings = Bindings::default();
         bindings.check(hotkey::DEFAULT).unwrap();
-        assert_eq!(bindings.back, "alt+left");
-        assert_eq!(bindings.fill, "f11");
-        assert_eq!(display(&bindings.zoom_in), "ctrl+plus");
+        assert_eq!(bindings.chord(Action::Back), "alt+left");
+        assert_eq!(bindings.chord(Action::Fill), "f11");
+        assert_eq!(display(bindings.chord(Action::ZoomIn)), "ctrl+plus");
+        for action in Action::ALL {
+            assert_eq!(Action::ALL[action.index()], action);
+        }
     }
 
     #[test]
@@ -264,7 +307,8 @@ mod tests {
     #[test]
     fn a_repeated_chord_and_bare_f5_are_rejected() {
         let mut bindings = Bindings::default();
-        bindings.forward = bindings.back.clone();
+        let back = bindings.chord(Action::Back).to_string();
+        bindings.set(Action::Forward, &back);
         assert!(
             bindings
                 .check(hotkey::DEFAULT)
@@ -273,7 +317,7 @@ mod tests {
                 .contains("Already used by Back")
         );
         bindings = Bindings::default();
-        bindings.zoom_in = "f5".to_string();
+        bindings.set(Action::ZoomIn, "f5");
         assert!(
             bindings
                 .check(hotkey::DEFAULT)

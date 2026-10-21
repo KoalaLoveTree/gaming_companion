@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+#[cfg(target_os = "linux")]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -15,10 +16,10 @@ use wry::{WebContext, WebViewBuilder};
 use crate::controller::paths::{self, webview_data_dir};
 use crate::controller::plugins::{choose, load_plugins};
 use crate::controller::prepare::{catalog_script, matching_resource, prepare_page};
-use crate::model::Plugin;
 use crate::model::bindings::{self, Action};
 use crate::model::config::{self, AppConfig, WindowFrame};
 use crate::model::hotkey::{self, Hotkey};
+use crate::model::{Page, Plugin};
 use crate::settings;
 use crate::{Error, Result};
 
@@ -60,13 +61,16 @@ pub fn launch() -> Result<()> {
     let config_file = paths::config_path()?;
     let mut config = paths::load_config(&config_file)?;
     let plugins = loaded.plugins;
-    let (plugin, resource) = choose(&plugins, &config)?;
-    let page = prepare_page(plugin, resource)?;
-    config.active_plugin = plugin.id.clone();
-    config.active_resource = Some(resource.id.clone());
+    let choice = choose(&plugins, &config)?;
+    for note in &choice.notes {
+        eprintln!("gaming_companion: {note}");
+    }
+    let page = prepare_page(choice.plugin, choice.resource)?;
+    config.active_plugin = choice.plugin.id.clone();
+    config.active_resource = Some(choice.resource.id.clone());
     let hotkey = hotkey::parse(&config.hotkey)?;
     config.hotkey = hotkey.canonical();
-    eprintln!("gaming_companion: {} ({})", page.title, plugin.id);
+    eprintln!("gaming_companion: {} ({})", page.title(), choice.plugin.id);
 
     // The portal registration has to finish before the display opens.
     // The parent string is filled once the Wayland window can export a handle.
@@ -91,7 +95,7 @@ pub fn launch() -> Result<()> {
 
     let startup = active_frame(&shell.config);
     let mut builder = WindowBuilder::new()
-        .with_title(page.title.clone())
+        .with_title(page.title())
         .with_inner_size(LogicalSize::new(startup.width, startup.height))
         .with_min_inner_size(LogicalSize::new(320.0, 240.0))
         .with_resizable(true)
@@ -123,7 +127,8 @@ pub fn launch() -> Result<()> {
         shell.config.overlay,
         &shell.config.bindings,
     )?;
-    OVERLAY.store(shell.config.overlay, Ordering::Relaxed);
+    #[cfg(windows)]
+    crate::win_chrome::set_overlay(shell.config.overlay);
     #[cfg(target_os = "linux")]
     crate::frame::set_overlay(shell.config.overlay);
     install_chrome(&window, &webview);
@@ -492,9 +497,6 @@ unsafe extern "system" {
     fn DeleteObject(object: *mut core::ffi::c_void) -> i32;
 }
 
-/// Overlay on or off. Windows hit-testing reads this while the pointer moves.
-static OVERLAY: AtomicBool = AtomicBool::new(false);
-
 thread_local! {
     /// Page zoom, separate from the monitor scale. Linux resets WebKit's zoom
     /// when the widget scale changes, and this is what it puts back.
@@ -516,7 +518,7 @@ fn install_chrome(window: &tao::window::Window, webview: &wry::WebView) {
     #[cfg(windows)]
     {
         let _ = webview;
-        install_windows_chrome(window);
+        crate::win_chrome::install(window);
     }
     #[cfg(not(any(target_os = "linux", windows)))]
     {
@@ -562,168 +564,10 @@ fn install_linux_chrome(window: &tao::window::Window, webview: &wry::WebView) {
     });
 }
 
-#[cfg(windows)]
-fn install_windows_chrome(window: &tao::window::Window) {
-    use tao::platform::windows::WindowExtWindows;
-    unsafe {
-        SetWindowSubclass(
-            window.hwnd() as *mut core::ffi::c_void,
-            chrome_subclass,
-            1,
-            0,
-        );
-    }
-}
-
-#[cfg(windows)]
-unsafe extern "system" fn chrome_subclass(
-    hwnd: *mut core::ffi::c_void,
-    msg: u32,
-    wparam: usize,
-    lparam: isize,
-    id: usize,
-    data: usize,
-) -> isize {
-    let _ = data;
-    const WM_NCHITTEST: u32 = 0x0084;
-    const WM_NCLBUTTONDBLCLK: u32 = 0x00A3;
-    const WM_NCDESTROY: u32 = 0x0082;
-    const WM_SYSCOMMAND: u32 = 0x0112;
-    const SC_MAXIMIZE: usize = 0xF030;
-    unsafe {
-        if msg == WM_NCDESTROY {
-            RemoveWindowSubclass(hwnd, chrome_subclass, id);
-            return DefSubclassProc(hwnd, msg, wparam, lparam);
-        }
-        if msg == WM_NCLBUTTONDBLCLK || (msg == WM_SYSCOMMAND && (wparam & 0xFFF0) == SC_MAXIMIZE) {
-            return 0;
-        }
-        if msg == WM_NCHITTEST {
-            let mut point = Point {
-                x: lparam as i16 as i32,
-                y: (lparam >> 16) as i16 as i32,
-            };
-            let mut rect = Rect {
-                left: 0,
-                top: 0,
-                right: 0,
-                bottom: 0,
-            };
-            if ScreenToClient(hwnd, &mut point) != 0 && GetClientRect(hwnd, &mut rect) != 0 {
-                let mut dpi = GetDpiForWindow(hwnd) as i32;
-                if dpi <= 0 {
-                    dpi = 96;
-                }
-                let ctrl = GetKeyState(0x11) < 0;
-                let overlay = OVERLAY.load(Ordering::Relaxed);
-                let decision = crate::chrome::hit(
-                    rect.right,
-                    rect.bottom,
-                    point.x,
-                    point.y,
-                    ctrl,
-                    overlay,
-                    dpi,
-                    96,
-                );
-                if matches!(decision, crate::chrome::Hit::Move)
-                    && crate::chrome::settings_target(
-                        rect.right,
-                        rect.bottom,
-                        point.x,
-                        point.y,
-                        overlay,
-                        dpi,
-                        96,
-                    )
-                {
-                    return hit_code(crate::chrome::Hit::Client);
-                }
-                return hit_code(decision);
-            }
-        }
-        DefSubclassProc(hwnd, msg, wparam, lparam)
-    }
-}
-
-#[cfg(windows)]
-fn hit_code(hit: crate::chrome::Hit) -> isize {
-    match hit {
-        crate::chrome::Hit::Pass => -1,
-        crate::chrome::Hit::Client => 1,
-        crate::chrome::Hit::Move => 2,
-        crate::chrome::Hit::Resize(crate::chrome::Edge::West) => 10,
-        crate::chrome::Hit::Resize(crate::chrome::Edge::East) => 11,
-        crate::chrome::Hit::Resize(crate::chrome::Edge::North) => 12,
-        crate::chrome::Hit::Resize(crate::chrome::Edge::NorthWest) => 13,
-        crate::chrome::Hit::Resize(crate::chrome::Edge::NorthEast) => 14,
-        crate::chrome::Hit::Resize(crate::chrome::Edge::South) => 15,
-        crate::chrome::Hit::Resize(crate::chrome::Edge::SouthWest) => 16,
-        crate::chrome::Hit::Resize(crate::chrome::Edge::SouthEast) => 17,
-    }
-}
-
-#[cfg(windows)]
-#[repr(C)]
-struct Point {
-    x: i32,
-    y: i32,
-}
-
-#[cfg(windows)]
-#[repr(C)]
-struct Rect {
-    left: i32,
-    top: i32,
-    right: i32,
-    bottom: i32,
-}
-
-#[cfg(windows)]
-#[link(name = "user32")]
-#[link(name = "comctl32")]
-unsafe extern "system" {
-    fn SetWindowSubclass(
-        hwnd: *mut core::ffi::c_void,
-        proc: unsafe extern "system" fn(
-            *mut core::ffi::c_void,
-            u32,
-            usize,
-            isize,
-            usize,
-            usize,
-        ) -> isize,
-        id: usize,
-        data: usize,
-    ) -> i32;
-    fn RemoveWindowSubclass(
-        hwnd: *mut core::ffi::c_void,
-        proc: unsafe extern "system" fn(
-            *mut core::ffi::c_void,
-            u32,
-            usize,
-            isize,
-            usize,
-            usize,
-        ) -> isize,
-        id: usize,
-    ) -> i32;
-    fn DefSubclassProc(
-        hwnd: *mut core::ffi::c_void,
-        msg: u32,
-        wparam: usize,
-        lparam: isize,
-    ) -> isize;
-    fn ScreenToClient(hwnd: *mut core::ffi::c_void, point: *mut Point) -> i32;
-    fn GetClientRect(hwnd: *mut core::ffi::c_void, rect: *mut Rect) -> i32;
-    fn GetKeyState(key: i32) -> i16;
-    fn GetDpiForWindow(hwnd: *mut core::ffi::c_void) -> u32;
-}
-
 fn build_webview<'a>(
     window: &'a tao::window::Window,
     web_context: &'a mut WebContext,
-    page: &crate::model::Page,
+    page: &Page,
     catalog: Option<&str>,
     plugins: &[Plugin],
     active_plugin: &str,
@@ -758,13 +602,10 @@ fn build_webview<'a>(
     if let Some(script) = catalog {
         builder = builder.with_initialization_script(script);
     }
-    if let Some(url) = &page.url {
-        builder = builder.with_url(url);
-    } else if let Some(html) = &page.html {
-        builder = builder.with_html(html);
-    } else {
-        return Err(Error::new("page has neither a url nor html"));
-    }
+    builder = match page {
+        Page::Url { url, .. } => builder.with_url(url),
+        Page::Html { html, .. } => builder.with_html(html),
+    };
 
     #[cfg(target_os = "linux")]
     let webview = {
@@ -1034,65 +875,47 @@ impl Shell {
     }
 
     fn on_ipc(&mut self, body: &str, window: &tao::window::Window, webview: &wry::WebView) {
-        let body = body.trim().trim_matches('"');
-        if body == "ready" {
-            self.push(webview);
-            return;
-        }
-        if body == "overlay" {
-            self.toggle_overlay(window, webview);
-            return;
-        }
-        if body == "back" {
-            let _ = webview.go_back();
-            return;
-        }
-        if body == "forward" {
-            let _ = webview.go_forward();
-            return;
-        }
-        if body == "reload" {
-            let _ = webview.reload();
-            return;
-        }
-        if body == "zoom-in" {
-            self.set_zoom(webview, self.zoom + 0.25);
-            return;
-        }
-        if body == "zoom-out" {
-            self.set_zoom(webview, self.zoom - 0.25);
-            return;
-        }
-        if body == "zoom-reset" {
-            self.set_zoom(webview, 1.0);
-            return;
-        }
-        if body == "fill" {
-            self.fill_toggle(window);
-            return;
-        }
-        if body == "escape" {
-            if self.filled {
-                self.restore_frame(window);
-            }
-            return;
-        }
-        if let Some(rest) = body.strip_prefix("bind:") {
-            self.bind_action(rest, window, webview);
-            return;
-        }
-        if let Some(id) = body.strip_prefix("open:") {
-            self.open_plugin(id.trim(), window, webview);
-            return;
-        }
-        if let Some(id) = body.strip_prefix("game:") {
-            self.open_game(id.trim(), window, webview);
-            return;
-        }
-        let Some(text) = body.strip_prefix("set:") else {
+        let Some(message) = crate::ipc::parse(body) else {
             return;
         };
-        let parsed = match hotkey::parse(text.trim()) {
+        match message {
+            crate::ipc::Message::Ready => self.push(webview),
+            crate::ipc::Message::Overlay => self.toggle_overlay(window, webview),
+            crate::ipc::Message::Navigate(action) => self.navigate(action, window, webview),
+            crate::ipc::Message::Escape => {
+                if self.filled {
+                    self.restore_frame(window);
+                }
+            }
+            crate::ipc::Message::Bind { action, chord } => {
+                self.bind_action(action, &chord, window, webview);
+            }
+            crate::ipc::Message::OpenPlugin(id) => self.open_plugin(&id, window, webview),
+            crate::ipc::Message::OpenGame(id) => self.open_game(&id, window, webview),
+            crate::ipc::Message::SetHotkey(text) => self.set_hotkey(&text, window, webview),
+        }
+    }
+
+    fn navigate(&mut self, action: Action, window: &tao::window::Window, webview: &wry::WebView) {
+        match action {
+            Action::Back => {
+                let _ = webview.go_back();
+            }
+            Action::Forward => {
+                let _ = webview.go_forward();
+            }
+            Action::Reload => {
+                let _ = webview.reload();
+            }
+            Action::ZoomIn => self.set_zoom(webview, self.zoom + 0.25),
+            Action::ZoomOut => self.set_zoom(webview, self.zoom - 0.25),
+            Action::ZoomReset => self.set_zoom(webview, 1.0),
+            Action::Fill => self.fill_toggle(window),
+        }
+    }
+
+    fn set_hotkey(&mut self, text: &str, window: &tao::window::Window, webview: &wry::WebView) {
+        let parsed = match hotkey::parse(text) {
             Ok(hotkey) => hotkey,
             Err(err) => {
                 self.status = err.to_string();
@@ -1200,21 +1023,16 @@ impl Shell {
         self.config.active_plugin = plugin.id.clone();
         self.config.active_resource = Some(resource.id.clone());
         self.persist();
-        window.set_title(&page.title);
-        let loaded = if let Some(url) = page.url.as_deref() {
-            webview.load_url(url)
-        } else if let Some(html) = page.html.as_deref() {
-            webview.load_html(html)
-        } else {
-            eprintln!("gaming_companion: page has neither a url nor html");
-            self.mark(webview);
-            return;
+        window.set_title(page.title());
+        let loaded = match &page {
+            Page::Url { url, .. } => webview.load_url(url),
+            Page::Html { html, .. } => webview.load_html(html),
         };
         if let Err(err) = loaded {
             eprintln!("gaming_companion: {err}");
         }
         self.mark(webview);
-        eprintln!("gaming_companion: {} ({})", page.title, plugin.id);
+        eprintln!("gaming_companion: {} ({})", page.title(), plugin.id);
     }
 
     fn follow_url(&mut self, url: &str, window: &tao::window::Window, webview: &wry::WebView) {
@@ -1271,14 +1089,14 @@ impl Shell {
         eprintln!("gaming_companion: restore");
     }
 
-    fn bind_action(&mut self, rest: &str, window: &tao::window::Window, webview: &wry::WebView) {
-        let Some((id, chord)) = rest.split_once(':') else {
-            return;
-        };
-        let Some(action) = Action::from_id(id) else {
-            return;
-        };
-        let canon = match bindings::normalized(chord.trim()) {
+    fn bind_action(
+        &mut self,
+        action: Action,
+        chord: &str,
+        window: &tao::window::Window,
+        webview: &wry::WebView,
+    ) {
+        let canon = match bindings::normalized(chord) {
             Ok(value) => value,
             Err(err) => {
                 self.status = err.to_string();
@@ -1305,7 +1123,8 @@ impl Shell {
         }
         self.filled = false;
         self.config.overlay = !self.config.overlay;
-        OVERLAY.store(self.config.overlay, Ordering::Relaxed);
+        #[cfg(windows)]
+        crate::win_chrome::set_overlay(self.config.overlay);
         #[cfg(target_os = "linux")]
         crate::frame::set_overlay(self.config.overlay);
         if self.config.overlay

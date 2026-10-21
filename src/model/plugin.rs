@@ -38,10 +38,30 @@ impl Plugin {
 }
 
 /// What the webview should show for one resource.
+///
+/// A remote resource is [`Page::Url`]. Local HTML and rendered Markdown are
+/// [`Page::Html`], with any injected CSS already in the document.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Page {
-    pub title: String,
-    pub url: Option<String>,
-    pub html: Option<String>,
-    pub init_script: Option<String>,
+pub enum Page {
+    Url {
+        title: String,
+        url: String,
+        /// Document-start script that injects this resource's CSS.
+        init_script: Option<String>,
+    },
+    Html {
+        title: String,
+        html: String,
+        /// Document-start script that injects this resource's CSS.
+        /// Local documents also embed that CSS in `html`.
+        init_script: Option<String>,
+    },
+}
+
+impl Page {
+    pub fn title(&self) -> &str {
+        match self {
+            Page::Url { title, .. } | Page::Html { title, .. } => title,
+        }
+    }
 }

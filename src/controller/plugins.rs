@@ -207,13 +207,19 @@ fn load_plugin_as(dir: &Path, game: Option<(String, String)>) -> Result<Plugin> 
     })
 }
 
-pub fn choose<'a>(
-    plugins: &'a [Plugin],
-    config: &crate::model::AppConfig,
-) -> Result<(&'a Plugin, &'a Resource)> {
+/// The plugin and resource to open, plus any reason the saved choice was replaced.
+#[derive(Debug)]
+pub struct Choice<'a> {
+    pub plugin: &'a Plugin,
+    pub resource: &'a Resource,
+    pub notes: Vec<String>,
+}
+
+pub fn choose<'a>(plugins: &'a [Plugin], config: &crate::model::AppConfig) -> Result<Choice<'a>> {
     if plugins.is_empty() {
         return Err(Error::new("no plugins found"));
     }
+    let mut notes = Vec::new();
     let plugin = match plugins
         .iter()
         .find(|plugin| plugin.id == config.active_plugin)
@@ -221,10 +227,10 @@ pub fn choose<'a>(
         Some(plugin) => plugin,
         None => {
             let fallback = &plugins[0];
-            eprintln!(
-                "gaming_companion: saved plugin '{}' is not installed, opening '{}'",
+            notes.push(format!(
+                "saved plugin '{}' is not installed, opening '{}'",
                 config.active_plugin, fallback.id
-            );
+            ));
             fallback
         }
     };
@@ -233,15 +239,23 @@ pub fn choose<'a>(
         .as_deref()
         .unwrap_or(plugin.entry.as_str());
     if let Some(resource) = plugin.resource(wanted) {
-        return Ok((plugin, resource));
+        return Ok(Choice {
+            plugin,
+            resource,
+            notes,
+        });
     }
-    eprintln!(
-        "gaming_companion: resource '{wanted}' is missing from '{}', opening '{}'",
+    notes.push(format!(
+        "resource '{wanted}' is missing from '{}', opening '{}'",
         plugin.id, plugin.entry
-    );
+    ));
     plugin
         .resource(&plugin.entry)
-        .map(|resource| (plugin, resource))
+        .map(|resource| Choice {
+            plugin,
+            resource,
+            notes,
+        })
         .ok_or_else(|| Error::new(format!("plugin '{}' has no entry resource", plugin.id)))
 }
 
@@ -429,11 +443,35 @@ src = "../outside.html"
             active_plugin: "sample".to_string(),
             ..AppConfig::default()
         };
-        let (plugin, resource) = choose(&loaded.plugins, &config).unwrap();
-        assert_eq!(plugin.id, "sample");
-        assert_eq!(plugin.game_id, "sample");
-        assert_eq!(resource.id, "page");
-        assert_eq!(resource.kind, ResourceKind::Url);
+        let choice = choose(&loaded.plugins, &config).unwrap();
+        assert!(choice.notes.is_empty());
+        assert_eq!(choice.plugin.id, "sample");
+        assert_eq!(choice.plugin.game_id, "sample");
+        assert_eq!(choice.resource.id, "page");
+        assert_eq!(choice.resource.kind, ResourceKind::Url);
+    }
+
+    #[test]
+    fn a_missing_saved_choice_explains_the_fallback() {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata");
+        let loaded = load_plugins(&dir).unwrap();
+        let missing_plugin = AppConfig {
+            active_plugin: "missing".to_string(),
+            ..AppConfig::default()
+        };
+        let choice = choose(&loaded.plugins, &missing_plugin).unwrap();
+        assert_eq!(choice.plugin.id, "sample");
+        assert_eq!(choice.notes.len(), 1);
+        assert!(choice.notes[0].contains("not installed"));
+
+        let missing_resource = AppConfig {
+            active_plugin: "sample".to_string(),
+            active_resource: Some("missing".to_string()),
+            ..AppConfig::default()
+        };
+        let choice = choose(&loaded.plugins, &missing_resource).unwrap();
+        assert_eq!(choice.resource.id, "page");
+        assert!(choice.notes[0].contains("missing"));
     }
 
     #[test]

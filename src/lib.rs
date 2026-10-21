@@ -3,6 +3,8 @@
 mod chrome;
 mod controller;
 mod error;
+mod ipc;
+mod js;
 mod model;
 mod settings;
 
@@ -13,6 +15,9 @@ mod gnome_pin;
 
 #[cfg(all(feature = "window", target_os = "linux"))]
 mod portal;
+
+#[cfg(all(feature = "window", windows))]
+mod win_chrome;
 
 #[cfg(feature = "window")]
 mod mark;

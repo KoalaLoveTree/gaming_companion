@@ -4,6 +4,8 @@
 //! Linux draws the border, navigation, and Settings with real widgets. Windows
 //! draws them in the page, in the top bar.
 
+use crate::js;
+use crate::model::bindings::Action;
 use crate::model::{Bindings, Plugin};
 
 /// Document-start script. Linux draws the border and Settings with real widgets.
@@ -26,15 +28,15 @@ pub(crate) fn script(
 ) -> String {
     let hint = hint(system_confirms);
     TEMPLATE
-        .replace("__HOTKEY__", &js_quote(hotkey))
-        .replace("__HINT__", &js_quote(&hint))
+        .replace("__HOTKEY__", &js::quote(hotkey))
+        .replace("__HINT__", &js::quote(&hint))
         .replace("__OVERLAY__", if overlay { "true" } else { "false" })
         .replace("__MARGIN__", &crate::chrome::MARGIN.to_string())
         .replace("__BORDER__", &crate::chrome::BORDER.to_string())
         .replace("__TOP__", &crate::chrome::TOP.to_string())
         .replace("__PLUGINS__", &plugins_js(plugins))
         .replace("__BINDINGS__", &bindings_js(bindings))
-        .replace("__ACTIVE__", &js_quote(active))
+        .replace("__ACTIVE__", &js::quote(active))
         .replace(
             "__NATIVE__",
             if cfg!(target_os = "linux") {
@@ -46,16 +48,30 @@ pub(crate) fn script(
 }
 
 fn bindings_js(bindings: &Bindings) -> String {
-    format!(
-        "{{back:{},forward:{},reload:{},zoomIn:{},zoomOut:{},zoomReset:{},fill:{}}}",
-        js_quote(&bindings.back),
-        js_quote(&bindings.forward),
-        js_quote(&bindings.reload),
-        js_quote(&bindings.zoom_in),
-        js_quote(&bindings.zoom_out),
-        js_quote(&bindings.zoom_reset),
-        js_quote(&bindings.fill),
-    )
+    let mut out = String::from("{");
+    for (index, action) in Action::ALL.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        out.push_str(js_field(*action));
+        out.push(':');
+        out.push_str(&js::quote(bindings.chord(*action)));
+    }
+    out.push('}');
+    out
+}
+
+/// Names the page script already reads. Zoom uses camel case there.
+fn js_field(action: Action) -> &'static str {
+    match action {
+        Action::Back => "back",
+        Action::Forward => "forward",
+        Action::Reload => "reload",
+        Action::ZoomIn => "zoomIn",
+        Action::ZoomOut => "zoomOut",
+        Action::ZoomReset => "zoomReset",
+        Action::Fill => "fill",
+    }
 }
 
 fn plugins_js(plugins: &[Plugin]) -> String {
@@ -66,10 +82,10 @@ fn plugins_js(plugins: &[Plugin]) -> String {
         }
         out.push_str(&format!(
             "{{id:{},name:{},game:{},gameName:{}}}",
-            js_quote(&plugin.id),
-            js_quote(&plugin.name),
-            js_quote(&plugin.game_id),
-            js_quote(&plugin.game_name),
+            js::quote(&plugin.id),
+            js::quote(&plugin.name),
+            js::quote(&plugin.game_id),
+            js::quote(&plugin.game_name),
         ));
     }
     out.push(']');
@@ -80,7 +96,7 @@ fn plugins_js(plugins: &[Plugin]) -> String {
 pub(crate) fn select_call(plugin_id: &str) -> String {
     format!(
         "if(window.__gc&&window.__gc.select)window.__gc.select({});",
-        js_quote(plugin_id)
+        js::quote(plugin_id)
     )
 }
 
@@ -96,28 +112,10 @@ pub(crate) fn bindings_call(bindings: &Bindings) -> String {
 pub(crate) fn apply_call(hotkey: &str, status: &str, overlay: bool) -> String {
     format!(
         "if(window.__gc)window.__gc.apply({},{},{});",
-        js_quote(hotkey),
-        js_quote(status),
+        js::quote(hotkey),
+        js::quote(status),
         if overlay { "true" } else { "false" }
     )
-}
-
-fn js_quote(value: &str) -> String {
-    let mut out = String::from("\"");
-    for ch in value.chars() {
-        match ch {
-            '\\' => out.push_str("\\\\"),
-            '"' => out.push_str("\\\""),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\u{2028}' => out.push_str("\\u2028"),
-            '\u{2029}' => out.push_str("\\u2029"),
-            ch if ch.is_control() => out.push_str(&format!("\\u{:04x}", ch as u32)),
-            ch => out.push(ch),
-        }
-    }
-    out.push('"');
-    out
 }
 
 const TEMPLATE: &str = r##"(function(){

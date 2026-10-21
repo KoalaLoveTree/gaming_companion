@@ -32,7 +32,7 @@ pub enum Key {
     Down,
     Left,
     Right,
-    F(u8),
+    F(FunctionKey),
     Minus,
     Equal,
     Comma,
@@ -135,7 +135,7 @@ impl Hotkey {
 impl Key {
     fn canonical(self) -> &'static str {
         match self {
-            Key::Char(ch) => leak_char(ch),
+            Key::Char(ch) => canonical_char(ch),
             Key::Space => "space",
             Key::Tab => "tab",
             Key::Escape => "escape",
@@ -151,7 +151,7 @@ impl Key {
             Key::Down => "down",
             Key::Left => "left",
             Key::Right => "right",
-            Key::F(n) => leak_f(n),
+            Key::F(n) => n.canonical_name(),
             Key::Minus => "minus",
             Key::Equal => "equal",
             Key::Comma => "comma",
@@ -168,7 +168,7 @@ impl Key {
 
     fn gtk_name(self) -> &'static str {
         match self {
-            Key::Char(ch) => leak_char(ch),
+            Key::Char(ch) => canonical_char(ch),
             Key::Space => "space",
             Key::Tab => "Tab",
             Key::Escape => "Escape",
@@ -184,7 +184,7 @@ impl Key {
             Key::Down => "Down",
             Key::Left => "Left",
             Key::Right => "Right",
-            Key::F(n) => leak_gtk_f(n),
+            Key::F(n) => n.gtk_name(),
             Key::Minus => "minus",
             Key::Equal => "equal",
             Key::Comma => "comma",
@@ -218,7 +218,7 @@ impl Key {
             Key::Down => "ArrowDown".to_string(),
             Key::Left => "ArrowLeft".to_string(),
             Key::Right => "ArrowRight".to_string(),
-            Key::F(n) => format!("F{n}"),
+            Key::F(n) => format!("F{}", n.number()),
             Key::Minus => "Minus".to_string(),
             Key::Equal => "Equal".to_string(),
             Key::Comma => "Comma".to_string(),
@@ -234,8 +234,58 @@ impl Key {
     }
 }
 
-/// `leak_char` returns a static name for one ascii letter or digit.
-fn leak_char(ch: char) -> &'static str {
+/// F1 through F12. Other numbers are not a key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FunctionKey(u8);
+
+impl FunctionKey {
+    pub fn new(n: u8) -> Option<Self> {
+        (1..=12).contains(&n).then_some(Self(n))
+    }
+
+    pub fn number(self) -> u8 {
+        self.0
+    }
+
+    fn canonical_name(self) -> &'static str {
+        match self.0 {
+            1 => "f1",
+            2 => "f2",
+            3 => "f3",
+            4 => "f4",
+            5 => "f5",
+            6 => "f6",
+            7 => "f7",
+            8 => "f8",
+            9 => "f9",
+            10 => "f10",
+            11 => "f11",
+            12 => "f12",
+            _ => unreachable!("function keys are F1 through F12"),
+        }
+    }
+
+    fn gtk_name(self) -> &'static str {
+        match self.0 {
+            1 => "F1",
+            2 => "F2",
+            3 => "F3",
+            4 => "F4",
+            5 => "F5",
+            6 => "F6",
+            7 => "F7",
+            8 => "F8",
+            9 => "F9",
+            10 => "F10",
+            11 => "F11",
+            12 => "F12",
+            _ => unreachable!("function keys are F1 through F12"),
+        }
+    }
+}
+
+/// Static name for one ascii letter or digit. Anything else has no key name.
+fn canonical_char(ch: char) -> &'static str {
     match ch {
         'a' => "a",
         'b' => "b",
@@ -274,42 +324,6 @@ fn leak_char(ch: char) -> &'static str {
         '8' => "8",
         '9' => "9",
         _ => "?",
-    }
-}
-
-fn leak_f(n: u8) -> &'static str {
-    match n {
-        1 => "f1",
-        2 => "f2",
-        3 => "f3",
-        4 => "f4",
-        5 => "f5",
-        6 => "f6",
-        7 => "f7",
-        8 => "f8",
-        9 => "f9",
-        10 => "f10",
-        11 => "f11",
-        12 => "f12",
-        _ => "f1",
-    }
-}
-
-fn leak_gtk_f(n: u8) -> &'static str {
-    match n {
-        1 => "F1",
-        2 => "F2",
-        3 => "F3",
-        4 => "F4",
-        5 => "F5",
-        6 => "F6",
-        7 => "F7",
-        8 => "F8",
-        9 => "F9",
-        10 => "F10",
-        11 => "F11",
-        12 => "F12",
-        _ => "F1",
     }
 }
 
@@ -402,6 +416,11 @@ fn apply_modifier(hotkey: &mut Hotkey, token: &str) -> bool {
     true
 }
 
+fn function_key(token: &str) -> Option<FunctionKey> {
+    let digits = token.strip_prefix('f')?;
+    FunctionKey::new(digits.parse().ok()?)
+}
+
 fn key_token(raw: &str) -> Result<Key> {
     let token = raw.trim().to_ascii_lowercase().replace('_', "");
     let key = match token.as_str() {
@@ -439,15 +458,7 @@ fn key_token(raw: &str) -> Result<Key> {
                 return Err(Error::new(format!("unknown key {raw}")));
             }
         }
-        other
-            if other.starts_with('f')
-                && other[1..]
-                    .parse::<u8>()
-                    .ok()
-                    .is_some_and(|n| (1..=12).contains(&n)) =>
-        {
-            Key::F(other[1..].parse().unwrap())
-        }
+        other if let Some(key) = function_key(other) => Key::F(key),
         _ => return Err(Error::new(format!("unknown key {raw}"))),
     };
     Ok(key)
@@ -488,6 +499,9 @@ mod tests {
     #[test]
     fn a_function_key_can_stand_alone_and_a_bare_letter_cannot() {
         assert_eq!(parse("F8").unwrap().canonical(), "f8");
+        assert_eq!(parse("f12").unwrap().canonical(), "f12");
+        assert!(parse("f0").is_err());
+        assert!(parse("f13").is_err());
         assert!(parse("").is_err());
         assert!(parse("ctrl").is_err());
         assert!(parse("a").is_err());

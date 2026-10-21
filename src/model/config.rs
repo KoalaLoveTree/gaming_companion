@@ -276,6 +276,29 @@ mod tests {
     }
 
     #[test]
+    fn the_keymap_is_stored_as_named_fields() {
+        let text = AppConfig::default().to_toml().unwrap();
+        assert!(text.contains("back = \"alt+left\""));
+        assert!(text.contains("fill = \"f11\""));
+        let parsed =
+            AppConfig::parse("active_plugin = \"sample\"\n[bindings]\nback = \"alt+a\"\n").unwrap();
+        assert_eq!(
+            parsed.bindings.chord(crate::model::bindings::Action::Back),
+            "alt+a"
+        );
+        assert_eq!(
+            parsed
+                .bindings
+                .chord(crate::model::bindings::Action::ZoomIn),
+            "ctrl+equal"
+        );
+        assert_eq!(
+            parsed.bindings.chord(crate::model::bindings::Action::Fill),
+            "f11"
+        );
+    }
+
+    #[test]
     fn a_page_shortcut_that_repeats_show_or_hide_is_rejected() {
         let text = "active_plugin = \"sample\"\nhotkey = \"alt+left\"\n";
         let err = AppConfig::parse(text).unwrap_err();

@@ -2,6 +2,7 @@ use pulldown_cmark::{Options, Parser, html};
 
 use super::plugins::{read_limited, resolve_inside};
 use crate::Result;
+use crate::js;
 use crate::model::{Page, Plugin, Resource, ResourceKind};
 
 pub fn prepare_page(plugin: &Plugin, resource: &Resource) -> Result<Page> {
@@ -9,10 +10,9 @@ pub fn prepare_page(plugin: &Plugin, resource: &Resource) -> Result<Page> {
     let title = format!("{} - {}", plugin.name, resource.title);
     let css = css_text(plugin, resource)?;
     match resource.kind {
-        ResourceKind::Url => Ok(Page {
+        ResourceKind::Url => Ok(Page::Url {
             title,
-            url: Some(resource.src.clone()),
-            html: None,
+            url: resource.src.clone(),
             init_script,
         }),
         ResourceKind::Html => {
@@ -21,24 +21,18 @@ pub fn prepare_page(plugin: &Plugin, resource: &Resource) -> Result<Page> {
             if let Some(css) = css {
                 html = embed_style(&html, &css);
             }
-            Ok(Page {
+            Ok(Page::Html {
                 title,
-                url: None,
-                html: Some(html),
+                html,
                 init_script,
             })
         }
         ResourceKind::Markdown => {
             let path = resolve_inside(&plugin.root, &resource.src)?;
             let markdown = read_limited(&path)?;
-            let html = Some(markdown_document(
-                &title,
-                &markdown,
-                css.as_deref().unwrap_or(""),
-            ));
-            Ok(Page {
+            let html = markdown_document(&title, &markdown, css.as_deref().unwrap_or(""));
+            Ok(Page::Html {
                 title,
-                url: None,
                 html,
                 init_script,
             })
@@ -60,8 +54,8 @@ pub fn catalog_script(plugins: &[Plugin]) -> Result<Option<String>> {
             };
             rules.push(format!(
                 "{{src:{},css:{}}}",
-                js_quote(&resource.src),
-                js_quote(&css)
+                js::quote(&resource.src),
+                js::quote(&css)
             ));
         }
     }
@@ -120,7 +114,7 @@ fn init_script(plugin: &Plugin, resource: &Resource) -> Result<Option<String>> {
     };
     Ok(Some(format!(
         "(function(){{var s=document.createElement('style');s.setAttribute('data-gaming-companion','inject');s.textContent={};(document.head||document.documentElement).appendChild(s);}})();",
-        js_quote(&css)
+        js::quote(&css)
     )))
 }
 
@@ -164,24 +158,6 @@ fn markdown_document(title: &str, markdown: &str, css: &str) -> String {
     )
 }
 
-fn js_quote(value: &str) -> String {
-    let mut out = String::from("\"");
-    for ch in value.chars() {
-        match ch {
-            '\\' => out.push_str("\\\\"),
-            '"' => out.push_str("\\\""),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\u{2028}' => out.push_str("\\u2028"),
-            '\u{2029}' => out.push_str("\\u2029"),
-            ch if ch.is_control() => out.push_str(&format!("\\u{:04x}", ch as u32)),
-            ch => out.push(ch),
-        }
-    }
-    out.push('"');
-    out
-}
-
 fn html_escape(value: &str) -> String {
     let mut out = String::new();
     for ch in value.chars() {
@@ -210,8 +186,14 @@ mod tests {
         let plugin = load_plugin(&root).unwrap();
         let resource = plugin.resource("page").unwrap();
         let page = prepare_page(&plugin, resource).unwrap();
-        assert_eq!(page.url.as_deref(), Some("https://example.com/sheet"));
-        let script = page.init_script.unwrap();
+        let Page::Url {
+            url, init_script, ..
+        } = page
+        else {
+            panic!("url resource should open as a url");
+        };
+        assert_eq!(url, "https://example.com/sheet");
+        let script = init_script.unwrap();
         assert!(script.contains("data-gaming-companion"));
         assert!(script.contains("sample-marker"));
     }
@@ -241,10 +223,11 @@ src = "note.md"
         fs::write(root.join("note.md"), "Hello **there**\n").unwrap();
         let plugin = load_plugin(&root).unwrap();
         let page = prepare_page(&plugin, plugin.resource("note").unwrap()).unwrap();
-        let html = page.html.unwrap();
+        let Page::Html { html, .. } = page else {
+            panic!("markdown should open as a document");
+        };
         assert!(html.contains("<strong>there</strong>"));
         assert!(html.contains("Pad &amp; &lt;co&gt;"));
-        assert!(page.url.is_none());
         let _ = fs::remove_dir_all(root);
     }
 }
