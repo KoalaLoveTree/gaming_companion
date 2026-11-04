@@ -10,8 +10,9 @@ use std::rc::Rc;
 
 use gtk::gdk::WindowEdge;
 use gtk::prelude::{
-    BoxExt, ButtonExt, ContainerExt, CssProviderExt, EventBoxExt, LabelExt, MenuButtonExt,
-    PopoverExt, ScrolledWindowExt, StyleContextExt, WidgetExt, WidgetExtManual,
+    BoxExt, ButtonExt, ContainerExt, CssProviderExt, DialogExt, EventBoxExt, GtkWindowExt, LabelExt,
+    MenuButtonExt, MessageDialogExt, PopoverExt, ScrolledWindowExt, StyleContextExt, WidgetExt,
+    WidgetExtManual,
 };
 
 use crate::chrome::{BORDER, GRIP, MARGIN, TOP};
@@ -347,7 +348,11 @@ struct NavPlugin {
 
 struct NavUi {
     popover: gtk::Popover,
-    plugins: Vec<NavPlugin>,
+    list: gtk::Box,
+    library: Vec<Plugin>,
+    rows: Vec<NavPlugin>,
+    on_message: Rc<dyn Fn(String)>,
+    window: gtk::ApplicationWindow,
 }
 
 struct Keys {
@@ -377,7 +382,7 @@ pub fn select(id: &str) {
         let Some(ui) = nav.as_ref() else {
             return;
         };
-        for plugin in &ui.plugins {
+        for plugin in &ui.rows {
             if plugin.id == id {
                 plugin.button.style_context().add_class("gc-chrome-on");
             } else {
@@ -484,7 +489,7 @@ fn install_settings(
     let plugins_popover = gtk::Popover::new(Some(&plugins_button));
     plugins_popover.set_position(gtk::PositionType::Bottom);
     plugins_button.set_popover(Some(&plugins_popover));
-    fill_plugin_list(&plugins_popover, plugins, &on_message);
+    fill_plugin_list(&plugins_popover, window, plugins, &on_message);
 
     let settings_popover = gtk::Popover::new(Some(&settings_button));
     settings_popover.set_position(gtk::PositionType::Bottom);
@@ -562,62 +567,184 @@ fn install_settings(
     });
 }
 
-fn fill_plugin_list(popover: &gtk::Popover, plugins: &[Plugin], on_message: &Rc<dyn Fn(String)>) {
+/// Replace the plugin list after a page is saved or deleted.
+pub fn set_plugins(plugins: &[Plugin]) {
+    NAV.with(|nav| {
+        let mut nav = nav.borrow_mut();
+        let Some(ui) = nav.as_mut() else {
+            return;
+        };
+        ui.library = plugins.to_vec();
+        refill(ui);
+    });
+}
+
+fn fill_plugin_list(
+    popover: &gtk::Popover,
+    window: &gtk::ApplicationWindow,
+    plugins: &[Plugin],
+    on_message: &Rc<dyn Fn(String)>,
+) {
     let scrolled = gtk::ScrolledWindow::new(None::<&gtk::Adjustment>, None::<&gtk::Adjustment>);
     scrolled.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
     scrolled.set_propagate_natural_width(true);
     scrolled.set_propagate_natural_height(true);
     scrolled.set_max_content_height(360);
-    scrolled.set_min_content_width(220);
+    scrolled.set_min_content_width(300);
 
     let list = gtk::Box::new(gtk::Orientation::Vertical, 2);
     list.set_margin_top(4);
     list.set_margin_bottom(6);
     list.set_margin_start(8);
     list.set_margin_end(8);
+    scrolled.add(&list);
 
-    let mut nav_plugins = Vec::new();
+    let add = gtk::Button::with_label("Add");
+    style_chrome(&add);
+    add.set_margin_start(8);
+    add.set_margin_end(8);
+    add.set_margin_bottom(8);
+    add.set_halign(gtk::Align::Fill);
+    let column = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    column.pack_start(&scrolled, true, true, 0);
+    column.pack_start(&add, false, false, 0);
+    popover.add(&column);
+
+    let ui = NavUi {
+        popover: popover.clone(),
+        list,
+        library: plugins.to_vec(),
+        rows: Vec::new(),
+        on_message: on_message.clone(),
+        window: window.clone(),
+    };
+    NAV.with(|nav| {
+        *nav.borrow_mut() = Some(ui);
+    });
+    NAV.with(|nav| {
+        if let Some(ui) = nav.borrow_mut().as_mut() {
+            refill(ui);
+        }
+    });
+
+    let window = window.clone();
+    let on_message = on_message.clone();
+    add.connect_clicked(move |_| {
+        let library = NAV.with(|nav| {
+            nav.borrow()
+                .as_ref()
+                .map(|ui| ui.library.clone())
+                .unwrap_or_default()
+        });
+        crate::form::open_add(&window, &library, on_message.clone());
+    });
+}
+
+fn refill(ui: &mut NavUi) {
+    for child in ui.list.children() {
+        ui.list.remove(&child);
+    }
+    let mut rows = Vec::new();
     let mut last_game = None;
-    for plugin in plugins {
+    for plugin in &ui.library {
         if last_game.as_deref() != Some(plugin.game_id.as_str()) {
             let title = gtk::Label::new(Some(&plugin.game_name));
             title.set_xalign(0.0);
             title.set_margin_top(6);
             title.style_context().add_class("gc-game");
-            list.pack_start(&title, false, false, 0);
+            ui.list.pack_start(&title, false, false, 0);
             last_game = Some(plugin.game_id.clone());
         }
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
         let button = gtk::Button::new();
         let label = gtk::Label::new(Some(&plugin.name));
         label.set_xalign(0.0);
         label.set_halign(gtk::Align::Start);
         button.add(&label);
+        button.set_hexpand(true);
         button.set_halign(gtk::Align::Fill);
-        button.set_margin_start(12);
         style_chrome(&button);
-        button.set_halign(gtk::Align::Fill);
-        let message = on_message.clone();
+        let message = ui.on_message.clone();
         let id = plugin.id.clone();
-        let popover = popover.clone();
+        let popover = ui.popover.clone();
         button.connect_clicked(move |_| {
             message(format!("open:{id}"));
             popover.popdown();
         });
-        list.pack_start(&button, false, false, 0);
-        nav_plugins.push(NavPlugin {
+        row.pack_start(&button, true, true, 0);
+        if plugin.owned {
+            let edit = gtk::Button::with_label("Edit");
+            let delete = gtk::Button::with_label("Delete");
+            style_chrome(&edit);
+            style_chrome(&delete);
+            let owned = plugin.clone();
+            let library = ui.library.clone();
+            let window = ui.window.clone();
+            let on_message = ui.on_message.clone();
+            edit.connect_clicked(move |_| {
+                crate::form::open_edit(&window, &library, &owned, on_message.clone());
+            });
+            let plugin_id = plugin.id.clone();
+            let library = ui.library.clone();
+            let window = ui.window.clone();
+            let on_message = ui.on_message.clone();
+            delete.connect_clicked(move |_| {
+                if !confirm_delete(&window) {
+                    return;
+                }
+                let user = match crate::controller::paths::user_plugins_dir() {
+                    Ok(path) => path,
+                    Err(err) => {
+                        notice(&window, &err.to_string());
+                        return;
+                    }
+                };
+                if let Err(err) =
+                    crate::controller::pages::delete_page(&user, &library, &plugin_id)
+                {
+                    notice(&window, &err.to_string());
+                    return;
+                }
+                on_message("refresh:".to_string());
+            });
+            row.pack_start(&edit, false, false, 0);
+            row.pack_start(&delete, false, false, 0);
+        }
+        ui.list.pack_start(&row, false, false, 0);
+        rows.push(NavPlugin {
             id: plugin.id.clone(),
             button,
         });
     }
+    ui.rows = rows;
+    ui.list.show_all();
+}
 
-    scrolled.add(&list);
-    popover.add(&scrolled);
-    NAV.with(|nav| {
-        *nav.borrow_mut() = Some(NavUi {
-            popover: popover.clone(),
-            plugins: nav_plugins,
-        });
-    });
+fn notice(window: &gtk::ApplicationWindow, text: &str) {
+    let dialog = gtk::MessageDialog::new(
+        Some(window),
+        gtk::DialogFlags::MODAL | gtk::DialogFlags::DESTROY_WITH_PARENT,
+        gtk::MessageType::Warning,
+        gtk::ButtonsType::Ok,
+        "",
+    );
+    dialog.set_text(Some(text));
+    dialog.run();
+    dialog.close();
+}
+
+fn confirm_delete(window: &gtk::ApplicationWindow) -> bool {
+    let dialog = gtk::MessageDialog::new(
+        Some(window),
+        gtk::DialogFlags::MODAL | gtk::DialogFlags::DESTROY_WITH_PARENT,
+        gtk::MessageType::Warning,
+        gtk::ButtonsType::OkCancel,
+        "",
+    );
+    dialog.set_text(Some("Delete this page?"));
+    let response = dialog.run();
+    dialog.close();
+    response == gtk::ResponseType::Ok
 }
 
 fn fill_settings_list(

@@ -38,6 +38,10 @@ pub(crate) fn script(
         .replace("__BINDINGS__", &bindings_js(bindings))
         .replace("__ACTIVE__", &js::quote(active))
         .replace(
+            "__CONFIRM__",
+            &js::quote(crate::controller::pages::UNPROTECTED_CONFIRM),
+        )
+        .replace(
             "__NATIVE__",
             if cfg!(target_os = "linux") {
                 "true"
@@ -81,11 +85,12 @@ fn plugins_js(plugins: &[Plugin]) -> String {
             out.push(',');
         }
         out.push_str(&format!(
-            "{{id:{},name:{},game:{},gameName:{}}}",
+            "{{id:{},name:{},game:{},gameName:{},owned:{}}}",
             js::quote(&plugin.id),
             js::quote(&plugin.name),
             js::quote(&plugin.game_id),
             js::quote(&plugin.game_name),
+            if plugin.owned { "true" } else { "false" },
         ));
     }
     out.push(']');
@@ -97,6 +102,42 @@ pub(crate) fn select_call(plugin_id: &str) -> String {
     format!(
         "if(window.__gc&&window.__gc.select)window.__gc.select({});",
         js::quote(plugin_id)
+    )
+}
+
+/// Replace the plugin list in the page after a save or a navigation.
+pub(crate) fn plugins_call(plugins: &[Plugin]) -> String {
+    format!(
+        "if(window.__gc&&window.__gc.plugins)window.__gc.plugins({});",
+        plugins_js(plugins)
+    )
+}
+
+pub(crate) fn checked_call(token: &str, url: &str, unprotected: bool) -> String {
+    format!(
+        "if(window.__gc&&window.__gc.checked)window.__gc.checked({},{},{});",
+        js::quote(token),
+        js::quote(url),
+        if unprotected { "true" } else { "false" }
+    )
+}
+
+pub(crate) fn check_failed_call(token: &str, message: &str) -> String {
+    format!(
+        "if(window.__gc&&window.__gc.checkFailed)window.__gc.checkFailed({},{});",
+        js::quote(token),
+        js::quote(message)
+    )
+}
+
+pub(crate) fn draft_call(json: &str) -> String {
+    format!("if(window.__gc&&window.__gc.draft)window.__gc.draft({json});")
+}
+
+pub(crate) fn form_error_call(message: &str) -> String {
+    format!(
+        "if(window.__gc&&window.__gc.formError)window.__gc.formError({});",
+        js::quote(message)
     )
 }
 
@@ -130,8 +171,9 @@ var MARGIN=__MARGIN__, BORDER=__BORDER__, TOP=__TOP__, NATIVE=__NATIVE__;
 var plugins=__PLUGINS__;
 var bindings=__BINDINGS__;
 var activePlugin=__ACTIVE__;
-var pluginsOpen=false, settingsOpen=false;
-var pluginsButton=null, settingsButton=null, pluginPanel=null, settingsPanel=null, mode=null, status=null;
+var pluginsOpen=false, settingsOpen=false, formOpen=false;
+var pluginsButton=null, settingsButton=null, pluginPanel=null, settingsPanel=null, pagePanel=null, mode=null, status=null;
+var formStatus=null, checkToken=0, formUrl="", formUnprotected=false, formOriginal="";
 var rows={};
 var chrome=null, strip=null;
 var CURSORS={
@@ -227,6 +269,30 @@ window.__gc={
   select:function(id){
     activePlugin=id;
     if(!NATIVE)rebuildTree();
+  },
+  plugins:function(next){
+    if(next)plugins=next;
+    if(!NATIVE)rebuildTree();
+  },
+  checked:function(token, url, unprotected){
+    if(String(token)!==String(checkToken))return;
+    formUrl=url||"";
+    formUnprotected=!!unprotected;
+    if(formStatus)formStatus.textContent=formUrl;
+    paintForm();
+  },
+  checkFailed:function(token, message){
+    if(String(token)!==String(checkToken))return;
+    formUrl="";
+    formUnprotected=false;
+    if(formStatus)formStatus.textContent=message||"This link could not be opened";
+    paintForm();
+  },
+  draft:function(page){
+    openForm(page||null);
+  },
+  formError:function(message){
+    if(formStatus)formStatus.textContent=message||"";
   }
 };
 function post(message){
@@ -252,31 +318,42 @@ function show(panel, on){
 }
 function setPlugins(on){
   pluginsOpen=!!on;
-  if(pluginsOpen)settingsOpen=false;
+  if(pluginsOpen){ settingsOpen=false; formOpen=false; }
   show(pluginPanel, pluginsOpen);
   show(settingsPanel, settingsOpen);
+  show(pagePanel, formOpen);
 }
 function setSettings(on){
   settingsOpen=!!on;
-  if(settingsOpen)pluginsOpen=false;
+  if(settingsOpen){ pluginsOpen=false; formOpen=false; }
   show(settingsPanel, settingsOpen);
   show(pluginPanel, pluginsOpen);
+  show(pagePanel, formOpen);
   if(!settingsOpen){
     recordingId=null;
     drafts={};
     paintRows();
   }
 }
+function setForm(on){
+  formOpen=!!on;
+  if(formOpen){ pluginsOpen=false; settingsOpen=false; }
+  show(pagePanel, formOpen);
+  show(pluginPanel, pluginsOpen);
+  show(settingsPanel, settingsOpen);
+}
 function closePanels(){
   pluginsOpen=false;
   settingsOpen=false;
+  formOpen=false;
   show(pluginPanel, false);
   show(settingsPanel, false);
+  show(pagePanel, false);
   recordingId=null;
   drafts={};
   paintRows();
 }
-function panelsOpen(){ return pluginsOpen||settingsOpen; }
+function panelsOpen(){ return pluginsOpen||settingsOpen||formOpen; }
 function rebuildTree(){
   if(!pluginPanel)return;
   while(pluginPanel.firstChild)pluginPanel.removeChild(pluginPanel.firstChild);
@@ -293,11 +370,16 @@ function rebuildTree(){
       });
       pluginPanel.appendChild(title);
     }
-    (function(id, name, on){
+    (function(id, name, on, owned){
+      var row=document.createElement("div");
+      pin(row,{
+        display:"flex", "flex-direction":"row", "align-items":"center", gap:"4px",
+        width:"100%", "pointer-events":"auto"
+      });
       var button=chromeButton(name);
       button.style.setProperty("display","block","important");
       button.style.setProperty("margin","2px 0 2px 12px","important");
-      button.style.setProperty("width","calc(100% - 12px)","important");
+      button.style.setProperty("flex","1 1 auto","important");
       if(on){
         button.style.setProperty("border-color","#f2f2f2","important");
         button.style.setProperty("background","#111111","important");
@@ -307,9 +389,249 @@ function rebuildTree(){
         post("open:"+id);
         setPlugins(false);
       }, true);
-      pluginPanel.appendChild(button);
-    })(plugin.id, plugin.name, plugin.id===activePlugin);
+      row.appendChild(button);
+      if(owned){
+        var edit=chromeButton("Edit");
+        var remove=chromeButton("Delete");
+        edit.addEventListener("click", function(event){
+          eat(event);
+          post("edit:"+id);
+        }, true);
+        remove.addEventListener("click", function(event){
+          eat(event);
+          if(window.confirm("Delete this page?"))post("delete:"+id);
+        }, true);
+        row.appendChild(edit);
+        row.appendChild(remove);
+      }
+      pluginPanel.appendChild(row);
+    })(plugin.id, plugin.name, plugin.id===activePlugin, !!plugin.owned);
   }
+  var add=chromeButton("Add");
+  add.style.setProperty("display","block","important");
+  add.style.setProperty("margin-top","8px","important");
+  add.addEventListener("click", function(event){
+    eat(event);
+    openForm(null);
+  }, true);
+  pluginPanel.appendChild(add);
+}
+function fieldLabel(text){
+  var label=document.createElement("div");
+  label.textContent=text;
+  pin(label,{
+    display:"block", color:"#d7d7d7", "font":"12px/1.3 system-ui, sans-serif",
+    "pointer-events":"none"
+  });
+  return label;
+}
+function fieldBox(){
+  return {
+    display:"block", width:"100%", padding:"4px 8px", "border-radius":"6px",
+    border:"1px solid #4a4a4a", background:"#111", color:"#f2f2f2",
+    "font":"13px/1.3 system-ui, sans-serif", "box-sizing":"border-box"
+  };
+}
+function paintForm(){
+  var save=document.getElementById("gc-page-save");
+  var check=document.getElementById("gc-page-check");
+  var warn=document.getElementById("gc-page-warn");
+  var kind=document.getElementById("gc-page-kind");
+  var name=document.getElementById("gc-page-name");
+  var link=document.getElementById("gc-page-url");
+  var game=document.getElementById("gc-page-game");
+  var fresh=document.getElementById("gc-page-new");
+  if(!save||!kind)return;
+  var isLink=kind.value!=="notes";
+  var typed=link?String(link.value||"").trim():"";
+  var chosen=formUrl && typed===formUrl ? formUrl : (formOriginal && typed===formOriginal ? formOriginal : "");
+  if(formUrl && typed && typed!==formOriginal && document.getElementById("gc-page-checked")){
+    var marked=document.getElementById("gc-page-checked").value;
+    if(typed===marked)chosen=formUrl;
+  }
+  var unprotected=chosen.indexOf("http://")===0;
+  if(warn)warn.style.setProperty("display", isLink&&unprotected?"block":"none", "important");
+  var gameReady=true;
+  if(game && game.value==="new")gameReady=!!(fresh && String(fresh.value||"").trim());
+  var ready=!!(name && String(name.value||"").trim()) && gameReady && (!isLink || !!chosen);
+  save.disabled=!ready;
+  if(check)check.disabled=!isLink;
+}
+function openForm(draft){
+  if(!pagePanel)return;
+  while(pagePanel.firstChild)pagePanel.removeChild(pagePanel.firstChild);
+  checkToken+=1;
+  formUrl="";
+  formUnprotected=false;
+  formOriginal=draft&&draft.kind==="link"?String(draft.url||""):"";
+  var editing=!!(draft&&draft.replace);
+  pagePanel.appendChild(fieldLabel("Game"));
+  var game=document.createElement("select");
+  game.id="gc-page-game";
+  pin(game, fieldBox());
+  var seen={};
+  for(var i=0;i<plugins.length;i++){
+    var plugin=plugins[i];
+    if(seen[plugin.game])continue;
+    seen[plugin.game]=true;
+    var option=document.createElement("option");
+    option.value=plugin.game;
+    option.textContent=plugin.gameName;
+    game.appendChild(option);
+  }
+  var newer=document.createElement("option");
+  newer.value="new";
+  newer.textContent="New game";
+  game.appendChild(newer);
+  pagePanel.appendChild(game);
+  var fresh=document.createElement("input");
+  fresh.id="gc-page-new";
+  fresh.type="text";
+  fresh.placeholder="Path of Exile";
+  pin(fresh, fieldBox());
+  pagePanel.appendChild(fresh);
+  pagePanel.appendChild(fieldLabel("Type"));
+  var kind=document.createElement("select");
+  kind.id="gc-page-kind";
+  pin(kind, fieldBox());
+  var linkOption=document.createElement("option");
+  linkOption.value="link";
+  linkOption.textContent="Link";
+  var notesOption=document.createElement("option");
+  notesOption.value="notes";
+  notesOption.textContent="Notes";
+  kind.appendChild(linkOption);
+  kind.appendChild(notesOption);
+  pagePanel.appendChild(kind);
+  pagePanel.appendChild(fieldLabel("Name"));
+  var name=document.createElement("input");
+  name.id="gc-page-name";
+  name.type="text";
+  name.placeholder="League notes";
+  pin(name, fieldBox());
+  pagePanel.appendChild(name);
+  var urlRow=document.createElement("div");
+  pin(urlRow,{display:"flex", gap:"6px", width:"100%"});
+  var link=document.createElement("input");
+  link.id="gc-page-url";
+  link.type="text";
+  link.placeholder="maxroll.gg/build";
+  pin(link, fieldBox());
+  link.style.setProperty("flex","1 1 auto","important");
+  var check=chromeButton("Check");
+  check.id="gc-page-check";
+  urlRow.appendChild(link);
+  urlRow.appendChild(check);
+  pagePanel.appendChild(urlRow);
+  var notes=document.createElement("textarea");
+  notes.id="gc-page-notes";
+  notes.placeholder="Path of Building paste, regexes, and other notes";
+  pin(notes, fieldBox());
+  notes.style.setProperty("min-height","8em","important");
+  notes.style.setProperty("resize","vertical","important");
+  pagePanel.appendChild(notes);
+  var checked=document.createElement("input");
+  checked.id="gc-page-checked";
+  checked.type="hidden";
+  pagePanel.appendChild(checked);
+  formStatus=document.createElement("div");
+  pin(formStatus,{
+    display:"block", color:"#d7d7d7", "font":"12px/1.4 system-ui, sans-serif",
+    "white-space":"normal", "max-width":"28em"
+  });
+  pagePanel.appendChild(formStatus);
+  var warn=document.createElement("div");
+  warn.id="gc-page-warn";
+  warn.textContent="This link is not protected. It was only available over http.";
+  pin(warn,{
+    display:"none", color:"#f2f2f2", "font":"12px/1.4 system-ui, sans-serif",
+    "white-space":"normal", "max-width":"28em"
+  });
+  pagePanel.appendChild(warn);
+  var footer=document.createElement("div");
+  pin(footer,{display:"flex", gap:"6px", width:"100%"});
+  var save=chromeButton("Save");
+  save.id="gc-page-save";
+  var cancel=chromeButton("Cancel");
+  footer.appendChild(save);
+  footer.appendChild(cancel);
+  pagePanel.appendChild(footer);
+  function showKind(){
+    var isLink=kind.value!=="notes";
+    urlRow.style.setProperty("display", isLink?"flex":"none", "important");
+    notes.style.setProperty("display", isLink?"none":"block", "important");
+    paintForm();
+  }
+  game.addEventListener("change", function(){
+    fresh.style.setProperty("display", game.value==="new"?"block":"none", "important");
+    paintForm();
+  }, true);
+  kind.addEventListener("change", showKind, true);
+  name.addEventListener("input", paintForm, true);
+  fresh.addEventListener("input", paintForm, true);
+  notes.addEventListener("input", paintForm, true);
+  link.addEventListener("input", function(){
+    checkToken+=1;
+    formUrl="";
+    formUnprotected=false;
+    checked.value="";
+    if(formStatus)formStatus.textContent="";
+    paintForm();
+  }, true);
+  check.addEventListener("click", function(event){
+    eat(event);
+    checkToken+=1;
+    formUrl="";
+    checked.value=String(link.value||"").trim();
+    formStatus.textContent="Checking the link…";
+    post("check:"+checkToken+"\n"+checked.value);
+    paintForm();
+  }, true);
+  save.addEventListener("click", function(event){
+    eat(event);
+    var typed=String(link.value||"").trim();
+    var chosen="";
+    if(checked.value && typed===checked.value && formUrl)chosen=formUrl;
+    else if(formOriginal && typed===formOriginal)chosen=formOriginal;
+    if(kind.value!=="notes" && !chosen){
+      formStatus.textContent="Check the link first";
+      return;
+    }
+    if(kind.value!=="notes" && chosen.indexOf("http://")===0){
+      if(!window.confirm(__CONFIRM__))return;
+    }
+    var gameId=editing?draft.gameId:(game.value==="new"?"":game.value);
+    var gameName=editing?draft.gameName:(game.value==="new"?String(fresh.value||""):game.options[game.selectedIndex].text);
+    post("save:"+JSON.stringify({
+      gameId:gameId,
+      gameName:gameName,
+      name:String(name.value||""),
+      kind:kind.value,
+      url:chosen,
+      text:String(notes.value||""),
+      replace:editing?draft.replace:null
+    }));
+  }, true);
+  cancel.addEventListener("click", function(event){
+    eat(event);
+    setForm(false);
+  }, true);
+  if(draft){
+    for(var n=0;n<game.options.length;n++){
+      if(game.options[n].value===draft.gameId)game.selectedIndex=n;
+    }
+    kind.value=draft.kind==="notes"?"notes":"link";
+    name.value=draft.name||"";
+    link.value=draft.url||"";
+    notes.value=draft.text||"";
+    game.disabled=true;
+    kind.disabled=true;
+  }else if(game.options.length===1){
+    game.value="new";
+  }
+  fresh.style.setProperty("display", game.value==="new"?"block":"none", "important");
+  showKind();
+  setForm(true);
 }
 function buildSettings(){
   if(!settingsPanel)return;
@@ -429,12 +751,12 @@ function setOverlay(on){
   if(mode)mode.textContent=overlayOn?"Window":"Overlay";
   placeChrome();
 }
-function panelStyle(top, side, offset, open, minWidth){
+function panelStyle(top, side, offset, open, minWidth, maxHeight){
   var style={
     position:"absolute", top:top, display:open?"flex":"none",
     "flex-direction":"column", gap:"4px", padding:"8px",
     background:"#242424", border:"1px solid #4a4a4a", "border-radius":"8px",
-    "z-index":"6", "pointer-events":"auto", "max-height":"360px",
+    "z-index":"6", "pointer-events":"auto", "max-height":maxHeight||"360px",
     overflow:"auto", "white-space":"normal",
     "font":"13px/1.3 system-ui, sans-serif", color:"#f2f2f2",
     "min-width":minWidth, "max-width":"calc(100vw - 24px)"
@@ -455,8 +777,9 @@ function placeChrome(){
     });
   }
   var top=(margin+TOP)+"px";
-  if(pluginPanel)pin(pluginPanel, panelStyle(top, "left", (margin+8)+"px", pluginsOpen, "180px"));
-  if(settingsPanel)pin(settingsPanel, panelStyle(top, "right", (margin+8)+"px", settingsOpen, "360px"));
+  if(pluginPanel)pin(pluginPanel, panelStyle(top, "left", (margin+8)+"px", pluginsOpen, "220px", "360px"));
+  if(settingsPanel)pin(settingsPanel, panelStyle(top, "right", (margin+8)+"px", settingsOpen, "360px", "360px"));
+  if(pagePanel)pin(pagePanel, panelStyle(top, "left", (margin+8)+"px", formOpen, "360px", "520px"));
   if(!chrome)return;
   var edges=chrome.querySelectorAll("[data-edge]");
   for(var i=0;i<edges.length;i++){
@@ -575,8 +898,11 @@ function buildChrome(){
   pluginPanel.id="gc-plugins";
   settingsPanel=document.createElement("div");
   settingsPanel.id="gc-settings-root";
+  pagePanel=document.createElement("div");
+  pagePanel.id="gc-page";
   chrome.appendChild(pluginPanel);
   chrome.appendChild(settingsPanel);
+  chrome.appendChild(pagePanel);
   buildSettings();
   rebuildTree();
   var kinds=["north","south","east","west","nw","ne","sw","se"];
@@ -672,6 +998,7 @@ window.addEventListener("pointerdown", function(event){
   var target=event.target;
   if(pluginPanel&&pluginPanel.contains(target))return;
   if(settingsPanel&&settingsPanel.contains(target))return;
+  if(pagePanel&&pagePanel.contains(target))return;
   if(pluginsButton&&pluginsButton.contains(target))return;
   if(settingsButton&&settingsButton.contains(target))return;
   closePanels();
@@ -720,6 +1047,10 @@ mod tests {
         assert!(source.contains("#f2f2f2"));
         assert!(source.contains("\"margin-left\":\"auto\""));
         assert!(source.contains("Plugins"));
+        assert!(source.contains("Add"));
+        assert!(source.contains("Delete this page?"));
+        assert!(source.contains("Check the link first"));
+        assert!(source.contains(crate::controller::pages::UNPROTECTED_CONFIRM));
         assert!(source.contains("Show or hide"));
         assert!(source.contains("Fill screen"));
         assert!(source.contains("Only Show or hide works while the game is focused."));

@@ -6,7 +6,7 @@ use serde::Deserialize;
 use crate::model::{Plugin, Resource, ResourceKind};
 use crate::{Error, Result};
 
-const MAX_TEXT_BYTES: u64 = 2 * 1024 * 1024;
+pub(crate) const MAX_TEXT_BYTES: u64 = 2 * 1024 * 1024;
 
 #[derive(Debug)]
 pub struct LoadOutcome {
@@ -24,6 +24,24 @@ struct PluginFile {
 }
 
 pub fn load_plugins(dir: &Path) -> Result<LoadOutcome> {
+    load_plugins_from(dir, false)
+}
+
+/// Shipped folders plus pages saved from the form. A user page keeps the
+/// shipped game name when both use the same game id, so the list has one heading.
+pub fn load_library(shipped: &Path, user: &Path) -> Result<LoadOutcome> {
+    let mut outcome = load_plugins(shipped)?;
+    if !user.is_dir() {
+        return Ok(outcome);
+    }
+    match load_plugins_from(user, true) {
+        Ok(extra) => merge_owned(&mut outcome, extra),
+        Err(err) => outcome.errors.push(err.to_string()),
+    }
+    Ok(outcome)
+}
+
+fn load_plugins_from(dir: &Path, owned: bool) -> Result<LoadOutcome> {
     let mut plugins = Vec::new();
     let mut errors = Vec::new();
     let entries = read_sorted(dir)?;
@@ -39,7 +57,7 @@ pub fn load_plugins(dir: &Path) -> Result<LoadOutcome> {
         // A folder with its own manifest is one plugin. Its children are files
         // of that plugin, not more plugins.
         if path.join("plugin.toml").is_file() {
-            consider(&path, None, &mut plugins, &mut errors);
+            consider(&path, None, owned, &mut plugins, &mut errors);
             continue;
         }
         let game = (name.clone(), game_label(&path, &name));
@@ -58,10 +76,43 @@ pub fn load_plugins(dir: &Path) -> Result<LoadOutcome> {
             if !child_path.join("plugin.toml").is_file() {
                 continue;
             }
-            consider(&child_path, Some(game.clone()), &mut plugins, &mut errors);
+            consider(
+                &child_path,
+                Some(game.clone()),
+                owned,
+                &mut plugins,
+                &mut errors,
+            );
         }
     }
 
+    sort_plugins(&mut plugins);
+    Ok(LoadOutcome { plugins, errors })
+}
+
+fn merge_owned(base: &mut LoadOutcome, extra: LoadOutcome) {
+    use std::collections::HashSet;
+
+    let mut ids: HashSet<String> = base.plugins.iter().map(|plugin| plugin.id.clone()).collect();
+    for mut plugin in extra.plugins {
+        if !ids.insert(plugin.id.clone()) {
+            base.errors.push(format!(
+                "{}: duplicate plugin id '{}'",
+                plugin.root.display(),
+                plugin.id
+            ));
+            continue;
+        }
+        if let Some(existing) = base.plugins.iter().find(|item| item.game_id == plugin.game_id) {
+            plugin.game_name = existing.game_name.clone();
+        }
+        base.plugins.push(plugin);
+    }
+    base.errors.extend(extra.errors);
+    sort_plugins(&mut base.plugins);
+}
+
+fn sort_plugins(plugins: &mut [Plugin]) {
     plugins.sort_by(|left, right| {
         left.game_name
             .to_ascii_lowercase()
@@ -73,16 +124,16 @@ pub fn load_plugins(dir: &Path) -> Result<LoadOutcome> {
             )
             .then(left.id.cmp(&right.id))
     });
-    Ok(LoadOutcome { plugins, errors })
 }
 
 fn consider(
     path: &Path,
     game: Option<(String, String)>,
+    owned: bool,
     plugins: &mut Vec<Plugin>,
     errors: &mut Vec<String>,
 ) {
-    match load_plugin_as(path, game) {
+    match load_plugin_as(path, game, owned) {
         Ok(plugin) => {
             if plugins.iter().any(|loaded| loaded.id == plugin.id) {
                 errors.push(format!(
@@ -159,10 +210,10 @@ struct GameFile {
 
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn load_plugin(dir: &Path) -> Result<Plugin> {
-    load_plugin_as(dir, None)
+    load_plugin_as(dir, None, false)
 }
 
-fn load_plugin_as(dir: &Path, game: Option<(String, String)>) -> Result<Plugin> {
+fn load_plugin_as(dir: &Path, game: Option<(String, String)>, owned: bool) -> Result<Plugin> {
     let root = dir
         .canonicalize()
         .map_err(|err| Error::new(format!("plugin directory: {err}")))?;
@@ -204,6 +255,7 @@ fn load_plugin_as(dir: &Path, game: Option<(String, String)>) -> Result<Plugin> 
         entry: file.entry,
         root,
         resources: file.resource,
+        owned,
     })
 }
 
@@ -323,7 +375,7 @@ pub fn read_limited(path: &Path) -> Result<String> {
     fs::read_to_string(path).map_err(|err| Error::new(format!("{}: {err}", path.display())))
 }
 
-fn is_remote_url(src: &str) -> bool {
+pub(crate) fn is_remote_url(src: &str) -> bool {
     let Some(rest) = src
         .strip_prefix("https://")
         .or_else(|| src.strip_prefix("http://"))
@@ -333,7 +385,7 @@ fn is_remote_url(src: &str) -> bool {
     !rest.is_empty() && !rest.chars().any(char::is_whitespace)
 }
 
-fn validate_id(id: &str) -> Result<()> {
+pub(crate) fn validate_id(id: &str) -> Result<()> {
     let mut chars = id.chars();
     let Some(first) = chars.next() else {
         return Err(Error::new("id is empty"));
@@ -557,5 +609,71 @@ src = "https://example.com/child"
         assert!(loaded.errors.is_empty(), "{:?}", loaded.errors);
         assert_eq!(loaded.plugins.len(), 1);
         assert_eq!(loaded.plugins[0].id, "whole");
+        assert!(!loaded.plugins[0].owned);
+    }
+
+    #[test]
+    fn a_user_page_joins_a_shipped_game_and_stays_owned() {
+        let shipped = TempDir::new();
+        let user = TempDir::new();
+        let game = shipped.0.join("arc-raiders");
+        write_plugin(
+            &game.join("maps"),
+            r#"
+id = "maps"
+name = "Maps"
+entry = "maps"
+[[resource]]
+id = "maps"
+title = "Maps"
+kind = "url"
+src = "https://example.com/maps"
+"#,
+        );
+        fs::write(game.join("game.toml"), "name = \"Arc Raiders\"\n").unwrap();
+        let custom = user.0.join("arc-raiders");
+        fs::create_dir_all(&custom).unwrap();
+        fs::write(custom.join("game.toml"), "name = \"Other\"\n").unwrap();
+        write_plugin(
+            &custom.join("notes"),
+            r#"
+id = "notes"
+name = "Notes"
+entry = "page"
+[[resource]]
+id = "page"
+title = "Notes"
+kind = "markdown"
+src = "notes.md"
+"#,
+        );
+        fs::write(custom.join("notes/notes.md"), "hi\n").unwrap();
+        write_plugin(
+            &user.0.join("poe").join("guide"),
+            r#"
+id = "maps"
+name = "Guide"
+entry = "page"
+[[resource]]
+id = "page"
+title = "Guide"
+kind = "url"
+src = "https://example.com/guide"
+"#,
+        );
+        fs::write(user.0.join("poe/game.toml"), "name = \"Path of Exile\"\n").unwrap();
+
+        let loaded = load_library(&shipped.0, &user.0).unwrap();
+        assert_eq!(loaded.plugins.len(), 2, "{:?}", loaded.errors);
+        assert!(loaded.errors.iter().any(|err| err.contains("duplicate")));
+        let maps = loaded.plugins.iter().find(|plugin| plugin.id == "maps").unwrap();
+        let notes = loaded
+            .plugins
+            .iter()
+            .find(|plugin| plugin.id == "notes")
+            .unwrap();
+        assert!(!maps.owned);
+        assert!(notes.owned);
+        assert_eq!(notes.game_name, "Arc Raiders");
     }
 }

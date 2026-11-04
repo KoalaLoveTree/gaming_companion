@@ -8,7 +8,9 @@ The process does not inject a DLL, read game memory, or send input. Plugins do n
 
 ## Plugins
 
-A plugin is a folder with `plugin.toml`. Plugins for one game live in one game folder, each plugin its own folder, so deleting that folder removes only that plugin. A folder that itself contains `plugin.toml` is a single plugin. The shell reads plugins at startup. Adding or editing one does not require a rebuild. No plugin ships with the app. Plugin folders are provided separately.
+A plugin is a folder with `plugin.toml`. Plugins for one game live in one game folder, each plugin its own folder, so deleting that folder removes only that plugin. A folder that itself contains `plugin.toml` is a single plugin. The shell reads plugins at startup and again after a page is saved or deleted. Adding or editing one does not require a rebuild. No plugin ships with the app. Plugin folders are provided separately.
+
+A page added from the Plugins list is stored in the config directory, in a game folder under `plugins`. The list can add, edit, and delete those pages. A page is a link or notes. The name has to contain a letter or a digit. A link is opened and shown before it is saved. An address with no scheme is saved as `https` when that responds, and as `http` only after confirmation that the link is not protected. An address that already says `https` is opened as written. Folders that came with the plugins directory are left as they are.
 
 A resource is a remote URL, a local HTML file, or Markdown. A URL may inject CSS and JS into that document. A path that leaves the plugin folder is rejected. The shell opens one named resource of one named plugin.
 

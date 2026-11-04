@@ -14,7 +14,7 @@ use tao::{
 use wry::{WebContext, WebViewBuilder};
 
 use crate::controller::paths::{self, webview_data_dir};
-use crate::controller::plugins::{choose, load_plugins};
+use crate::controller::plugins::{choose, load_library};
 use crate::controller::prepare::{catalog_script, matching_resource, prepare_page};
 use crate::model::bindings::{self, Action};
 use crate::model::config::{self, AppConfig, WindowFrame};
@@ -46,6 +46,15 @@ enum ShellEvent {
     /// The window exists, so the portal dialog can be parented to it.
     StartBind,
     Quit,
+    LinkReady {
+        token: String,
+        url: String,
+        unprotected: bool,
+    },
+    LinkFailed {
+        token: String,
+        message: String,
+    },
 }
 
 pub fn launch() -> Result<()> {
@@ -54,7 +63,8 @@ pub fn launch() -> Result<()> {
     linux_scale::prepare_renderer();
 
     let plugins_path = paths::plugins_dir()?;
-    let loaded = load_plugins(&plugins_path)?;
+    let user_plugins = paths::user_plugins_dir()?;
+    let loaded = load_library(&plugins_path, &user_plugins)?;
     for err in &loaded.errors {
         eprintln!("gaming_companion: skipped plugin: {err}");
     }
@@ -169,7 +179,9 @@ pub fn launch() -> Result<()> {
         crate::gnome_pin::schedule();
     }
 
-    event_loop.run(move |event, _, control_flow| {
+    event_loop.run(move |event, target, control_flow| {
+        #[cfg(not(windows))]
+        let _ = target;
         *control_flow = ControlFlow::Wait;
         let _keep_context = &web_context;
         let _keep_tray = &tray;
@@ -179,30 +191,53 @@ pub fn launch() -> Result<()> {
         }
         match event {
             Event::WindowEvent {
+                window_id,
                 event: WindowEvent::CloseRequested,
                 ..
             } => {
-                shell.save(&window);
-                *control_flow = ControlFlow::ExitWithCode(0);
+                if shell.is_preview(window_id) {
+                    shell.dismiss_preview();
+                } else {
+                    shell.save(&window);
+                    *control_flow = ControlFlow::ExitWithCode(0);
+                }
             }
             Event::WindowEvent {
+                window_id,
                 event: WindowEvent::Resized(_),
                 ..
-            } => shell.pass_margin(&window),
+            } => {
+                if !shell.is_preview(window_id) {
+                    shell.pass_margin(&window);
+                }
+            }
             // Windows and macOS. The webview already paints at this scale.
             // Reapply the user's page zoom. It is not the monitor scale.
             Event::WindowEvent {
+                window_id,
                 event: WindowEvent::ScaleFactorChanged { scale_factor, .. },
                 ..
             } => {
-                let _ = webview.zoom(shell.zoom);
-                eprintln!("gaming_companion: {}", monitor_label(&window, scale_factor));
+                if !shell.is_preview(window_id) {
+                    let _ = webview.zoom(shell.zoom);
+                    eprintln!("gaming_companion: {}", monitor_label(&window, scale_factor));
+                }
             }
             Event::UserEvent(ShellEvent::Quit) => {
                 shell.save(&window);
                 *control_flow = ControlFlow::ExitWithCode(0);
             }
-            Event::UserEvent(shell_event) => shell.on_event(shell_event, &window, &webview),
+            Event::UserEvent(shell_event) => {
+                #[cfg(windows)]
+                if let ShellEvent::LinkReady { ref url, .. } = shell_event {
+                    let url = url.clone();
+                    shell.open_preview(target, &window, &url);
+                }
+                if matches!(shell_event, ShellEvent::LinkFailed { .. }) {
+                    shell.dismiss_preview();
+                }
+                shell.on_event(shell_event, &window, &webview);
+            }
             _ => {}
         }
     });
@@ -735,6 +770,15 @@ impl Grabber {
     }
 }
 
+#[cfg(windows)]
+struct Preview {
+    webview: wry::WebView,
+    window: tao::window::Window,
+    /// Held so the preview context stays alive for as long as the view does.
+    #[allow(dead_code)]
+    context: WebContext,
+}
+
 struct Shell {
     config: AppConfig,
     config_file: PathBuf,
@@ -751,6 +795,9 @@ struct Shell {
     zoom: f64,
     /// The window currently fills the monitor. Config still holds the frame from before that.
     filled: bool,
+    proxy: EventLoopProxy<ShellEvent>,
+    #[cfg(windows)]
+    preview: Option<Preview>,
 }
 
 impl Shell {
@@ -763,6 +810,7 @@ impl Shell {
         plugins: Vec<Plugin>,
     ) -> Self {
         let shortcut = hotkey.canonical();
+        let check_proxy = proxy.clone();
         let mut initial = None;
         let (host, live, status) = match prepared {
             #[cfg(target_os = "linux")]
@@ -818,6 +866,9 @@ impl Shell {
             bind_started: false,
             zoom: 1.0,
             filled: false,
+            proxy: check_proxy,
+            #[cfg(windows)]
+            preview: None,
         }
     }
 
@@ -850,6 +901,16 @@ impl Shell {
             ShellEvent::StartBind => self.start_bind(window, webview),
             // Quit exits from the event loop so the frame is saved first.
             ShellEvent::Quit => {}
+            ShellEvent::LinkReady {
+                token,
+                url,
+                unprotected,
+            } => {
+                let _ = webview.evaluate_script(&settings::checked_call(&token, &url, unprotected));
+            }
+            ShellEvent::LinkFailed { token, message } => {
+                let _ = webview.evaluate_script(&settings::check_failed_call(&token, &message));
+            }
         }
     }
 
@@ -893,7 +954,216 @@ impl Shell {
             crate::ipc::Message::OpenPlugin(id) => self.open_plugin(&id, window, webview),
             crate::ipc::Message::OpenGame(id) => self.open_game(&id, window, webview),
             crate::ipc::Message::SetHotkey(text) => self.set_hotkey(&text, window, webview),
+            crate::ipc::Message::Refresh(id) => self.apply_library(&id, window, webview),
+            crate::ipc::Message::CheckLink { token, url } => self.check_link(token, url),
+            crate::ipc::Message::SavePage(json) => self.save_page(&json, window, webview),
+            crate::ipc::Message::DeletePage(id) => self.delete_page(&id, window, webview),
+            crate::ipc::Message::EditPage(id) => self.edit_page(&id, webview),
         }
+    }
+
+    fn check_link(&self, token: String, url: String) {
+        let proxy = self.proxy.clone();
+        std::thread::spawn(move || {
+            let event = match crate::controller::pages::resolve_link(&url) {
+                Ok(resolved) => ShellEvent::LinkReady {
+                    token,
+                    url: resolved.url,
+                    unprotected: resolved.unprotected,
+                },
+                Err(err) => ShellEvent::LinkFailed {
+                    token,
+                    message: err.to_string(),
+                },
+            };
+            let _ = proxy.send_event(event);
+        });
+    }
+
+    fn save_page(&mut self, json: &str, window: &tao::window::Window, webview: &wry::WebView) {
+        let user = match paths::user_plugins_dir() {
+            Ok(path) => path,
+            Err(err) => {
+                self.form_error(webview, &err.to_string());
+                return;
+            }
+        };
+        match crate::controller::pages::save_from_json(&user, &self.plugins, json) {
+            Ok(id) => self.apply_library(&id, window, webview),
+            Err(err) => self.form_error(webview, &err.to_string()),
+        }
+    }
+
+    fn delete_page(&mut self, id: &str, window: &tao::window::Window, webview: &wry::WebView) {
+        let user = match paths::user_plugins_dir() {
+            Ok(path) => path,
+            Err(err) => {
+                self.form_error(webview, &err.to_string());
+                return;
+            }
+        };
+        match crate::controller::pages::delete_page(&user, &self.plugins, id) {
+            Ok(()) => self.apply_library("", window, webview),
+            Err(err) => self.form_error(webview, &err.to_string()),
+        }
+    }
+
+    fn edit_page(&self, id: &str, webview: &wry::WebView) {
+        let Some(plugin) = self.plugins.iter().find(|plugin| plugin.id == id) else {
+            self.form_error(webview, "That page is not in the list");
+            return;
+        };
+        match crate::controller::pages::read_draft(plugin) {
+            Ok(draft) => {
+                let json = crate::controller::pages::draft_json(&draft);
+                let _ = webview.evaluate_script(&settings::draft_call(&json));
+            }
+            Err(err) => self.form_error(webview, &err.to_string()),
+        }
+    }
+
+    fn form_error(&self, webview: &wry::WebView, message: &str) {
+        eprintln!("gaming_companion: {message}");
+        let _ = webview.evaluate_script(&settings::form_error_call(message));
+    }
+
+    fn push_plugin_script(&self, webview: &wry::WebView) {
+        let _ = webview.evaluate_script(&settings::plugins_call(&self.plugins));
+    }
+
+    fn apply_library(&mut self, open: &str, window: &tao::window::Window, webview: &wry::WebView) {
+        let shipped = match paths::plugins_dir() {
+            Ok(path) => path,
+            Err(err) => {
+                self.form_error(webview, &err.to_string());
+                return;
+            }
+        };
+        let user = match paths::user_plugins_dir() {
+            Ok(path) => path,
+            Err(err) => {
+                self.form_error(webview, &err.to_string());
+                return;
+            }
+        };
+        let loaded = match load_library(&shipped, &user) {
+            Ok(loaded) => loaded,
+            Err(err) => {
+                self.form_error(webview, &err.to_string());
+                return;
+            }
+        };
+        for err in &loaded.errors {
+            eprintln!("gaming_companion: skipped plugin: {err}");
+        }
+        if loaded.plugins.is_empty() {
+            self.form_error(webview, "no plugins found");
+            return;
+        }
+        self.plugins = loaded.plugins;
+        self.dismiss_preview();
+        #[cfg(target_os = "linux")]
+        crate::frame::set_plugins(&self.plugins);
+        self.push_plugin_script(webview);
+        let open_id = if !open.is_empty() && self.plugins.iter().any(|plugin| plugin.id == open) {
+            Some(open.to_string())
+        } else if self
+            .plugins
+            .iter()
+            .any(|plugin| plugin.id == self.config.active_plugin)
+        {
+            None
+        } else {
+            self.plugins.first().map(|plugin| plugin.id.clone())
+        };
+        if let Some(id) = open_id {
+            self.show_plugin(&id, window, webview, true);
+        } else {
+            self.mark(webview);
+        }
+    }
+
+    fn is_preview(&self, id: tao::window::WindowId) -> bool {
+        #[cfg(windows)]
+        {
+            return self
+                .preview
+                .as_ref()
+                .is_some_and(|preview| preview.window.id() == id);
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (self, id);
+            false
+        }
+    }
+
+    fn dismiss_preview(&mut self) {
+        #[cfg(windows)]
+        {
+            self.preview = None;
+        }
+    }
+
+    #[cfg(windows)]
+    fn open_preview(
+        &mut self,
+        target: &tao::event_loop::EventLoopWindowTarget<ShellEvent>,
+        parent: &tao::window::Window,
+        url: &str,
+    ) {
+        if let Some(preview) = &self.preview {
+            let _ = preview.webview.load_url(url);
+            preview.window.set_visible(true);
+            return;
+        }
+        let dir = match paths::webview_data_dir() {
+            Ok(path) => path.join("preview"),
+            Err(err) => {
+                eprintln!("gaming_companion: {err}");
+                return;
+            }
+        };
+        if let Err(err) = std::fs::create_dir_all(&dir) {
+            eprintln!("gaming_companion: {err}");
+            return;
+        }
+        let mut builder = WindowBuilder::new()
+            .with_title("Preview")
+            .with_inner_size(LogicalSize::new(900.0, 700.0))
+            .with_decorations(true)
+            .with_resizable(true)
+            .with_always_on_top(true);
+        if let Ok(pos) = parent.outer_position() {
+            let size = parent.outer_size();
+            builder = builder.with_position(tao::dpi::PhysicalPosition::new(
+                pos.x + size.width as i32 + 12,
+                pos.y,
+            ));
+        }
+        let preview_window = match builder.build(target) {
+            Ok(window) => window,
+            Err(err) => {
+                eprintln!("gaming_companion: preview: {err}");
+                return;
+            }
+        };
+        let mut context = WebContext::new(Some(dir));
+        let webview = match WebViewBuilder::new_with_web_context(&mut context)
+            .with_url(url)
+            .build(&preview_window)
+        {
+            Ok(webview) => webview,
+            Err(err) => {
+                eprintln!("gaming_companion: preview: {err}");
+                return;
+            }
+        };
+        self.preview = Some(Preview {
+            webview,
+            window: preview_window,
+            context,
+        });
     }
 
     fn navigate(&mut self, action: Action, window: &tao::window::Window, webview: &wry::WebView) {
@@ -1004,7 +1274,17 @@ impl Shell {
     }
 
     fn open_plugin(&mut self, id: &str, window: &tao::window::Window, webview: &wry::WebView) {
-        if id == self.config.active_plugin {
+        self.show_plugin(id, window, webview, false);
+    }
+
+    fn show_plugin(
+        &mut self,
+        id: &str,
+        window: &tao::window::Window,
+        webview: &wry::WebView,
+        force: bool,
+    ) {
+        if !force && id == self.config.active_plugin {
             return;
         }
         let Some(plugin) = self.plugins.iter().find(|plugin| plugin.id == id).cloned() else {
@@ -1056,6 +1336,7 @@ impl Shell {
                 eprintln!("gaming_companion: {title} ({id})");
             }
         }
+        self.push_plugin_script(webview);
         self.mark(webview);
     }
 

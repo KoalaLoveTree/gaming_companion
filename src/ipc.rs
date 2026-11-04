@@ -15,6 +15,12 @@ pub(crate) enum Message {
     OpenPlugin(String),
     OpenGame(String),
     SetHotkey(String),
+    /// Reload plugins and open this page. An empty id keeps the current page when it still exists.
+    Refresh(String),
+    CheckLink { token: String, url: String },
+    SavePage(String),
+    DeletePage(String),
+    EditPage(String),
 }
 
 /// `None` is a message the shell ignores.
@@ -42,6 +48,35 @@ fn parse_prefixed(body: &str) -> Option<Message> {
     }
     if let Some(id) = body.strip_prefix("open:") {
         return Some(Message::OpenPlugin(id.trim().to_string()));
+    }
+    if let Some(id) = body.strip_prefix("refresh:") {
+        return Some(Message::Refresh(id.trim().to_string()));
+    }
+    if body == "refresh" {
+        return Some(Message::Refresh(String::new()));
+    }
+    if let Some(rest) = body.strip_prefix("check:") {
+        let (token, url) = rest.split_once('\n')?;
+        let token = token.trim();
+        if token.is_empty()
+            || token.len() > 20
+            || !token.chars().all(|ch| ch.is_ascii_digit())
+        {
+            return None;
+        }
+        return Some(Message::CheckLink {
+            token: token.to_string(),
+            url: url.trim().to_string(),
+        });
+    }
+    if let Some(json) = body.strip_prefix("save:") {
+        return Some(Message::SavePage(json.trim().to_string()));
+    }
+    if let Some(id) = body.strip_prefix("delete:") {
+        return Some(Message::DeletePage(id.trim().to_string()));
+    }
+    if let Some(id) = body.strip_prefix("edit:") {
+        return Some(Message::EditPage(id.trim().to_string()));
     }
     if let Some(id) = body.strip_prefix("game:") {
         return Some(Message::OpenGame(id.trim().to_string()));
@@ -81,6 +116,27 @@ mod tests {
             parse("set: ctrl+alt+space"),
             Some(Message::SetHotkey("ctrl+alt+space".to_string()))
         );
+        assert_eq!(parse("refresh"), Some(Message::Refresh(String::new())));
+        assert_eq!(
+            parse("refresh:notes"),
+            Some(Message::Refresh("notes".to_string()))
+        );
+        assert_eq!(
+            parse("check:3\nhttps://maxroll.gg/build"),
+            Some(Message::CheckLink {
+                token: "3".to_string(),
+                url: "https://maxroll.gg/build".to_string(),
+            })
+        );
+        assert_eq!(
+            parse("save:{\"kind\":\"notes\"}"),
+            Some(Message::SavePage("{\"kind\":\"notes\"}".to_string()))
+        );
+        assert_eq!(
+            parse("delete:notes"),
+            Some(Message::DeletePage("notes".to_string()))
+        );
+        assert_eq!(parse("edit:notes"), Some(Message::EditPage("notes".to_string())));
     }
 
     #[test]

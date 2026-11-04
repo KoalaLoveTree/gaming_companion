@@ -8,6 +8,11 @@ pub fn config_path() -> Result<PathBuf> {
     Ok(app_dir()?.join("config.toml"))
 }
 
+/// Pages saved from the Plugins form. Absent until the first save.
+pub fn user_plugins_dir() -> Result<PathBuf> {
+    Ok(app_dir()?.join("plugins"))
+}
+
 pub fn webview_data_dir() -> Result<PathBuf> {
     let dir = app_dir()?.join("webview");
     std::fs::create_dir_all(&dir)?;

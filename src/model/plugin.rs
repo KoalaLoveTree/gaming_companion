@@ -29,6 +29,8 @@ pub struct Plugin {
     pub entry: String,
     pub root: std::path::PathBuf,
     pub resources: Vec<Resource>,
+    /// The page was saved from the Plugins form. Shipped folders stay false.
+    pub owned: bool,
 }
 
 impl Plugin {
