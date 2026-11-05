@@ -20,7 +20,10 @@ Other distributions need the development packages for GTK 3, WebKitGTK 4.1, and 
 make linux      # target/release/gaming_companion
 make windows    # target/x86_64-pc-windows-msvc/release/gaming_companion.exe
 make run        # debug build, then open the window
+make cover      # target/llvm-cov/html/index.html
 ```
+
+`make cover` needs [cargo-llvm-cov](https://github.com/taiki-e/cargo-llvm-cov) and the `llvm-tools-preview` rustup component. Publishing downloadable zips is described in [docs/github-releases.md](docs/github-releases.md).
 
 `make windows` cross-compiles from Linux. It needs [cargo-xwin](https://github.com/rust-cross/cargo-xwin) and the `x86_64-pc-windows-msvc` target. The `.exe` uses a static CRT, so the Visual C++ redistributable is not required. The Windows PC needs WebView2, which is already present when Edge is installed.
 
